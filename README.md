@@ -4,6 +4,15 @@ A fast, good-looking Markdown viewer for Linux, in the spirit of Typora.
 Native GTK 4 and Rust, no web engine. v1 opens and displays files; v2 will
 add Typora-style inline editing on the same engine.
 
+## Install a release
+
+Download `folio-*-x86_64-linux.tar.gz` from Releases. It needs GTK 4.12+ and
+glibc 2.39+ (Ubuntu 24.04, Fedora 40 or newer).
+
+```sh
+tar xzf folio-*-x86_64-linux.tar.gz && ./folio-*/install.sh
+```
+
 ## Build & run
 
 ```sh

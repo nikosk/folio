@@ -80,8 +80,11 @@ pessimistic), 750 KB / 2,700-block file:
 
 File size doesn't change startup time: the 750 KB file reaches the screen as
 fast as a 3 KB one. Most of the cold start is GTK itself (library loading,
-renderer and theme initialisation). Pick the renderer with `GSK_RENDERER=cairo`
-or `GSK_RENDERER=ngl` / `vulkan`.
+renderer and theme initialisation).
+
+Folio uses GTK's default GPU renderer, which gives smooth scrolling at any
+window size. The Cairo software renderer starts faster and uses less memory
+but draws every frame on the CPU. Try it with `GSK_RENDERER=cairo folio FILE`.
 
 ## Development
 
@@ -92,6 +95,7 @@ folio --bench FILE                     # engine timings, no display needed
 python3 samples/gen_big.py             # generate samples/big.md for benchmarking
 FOLIO_STARTUP=1 folio FILE             # print startup phase timings, exit after first frame
 FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND)
+scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE   # no display needed
 ```
 
 | File | Role |

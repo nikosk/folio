@@ -1,0 +1,112 @@
+# Hand-off: Folio v1 → v2
+
+Folio is a fast, Typora-style Markdown app for Linux. v1, the viewer, shipped
+as `v0.1.0`. v2 adds Typora-style inline editing. Read `README.md` first for
+features, keys and the file map; this document covers what the code doesn't say.
+
+## Goals, in priority order
+
+1. **Speed.** Startup should be near-instant, and every operation (typing
+   included) should have imperceptible lag: well under one frame.
+2. **Aesthetics.** It should look as good as Typora.
+3. Full Markdown support (CommonMark, GFM, math, footnotes, …).
+
+## Decisions made, and why
+
+| Decision | Why |
+|---|---|
+| Rust + GTK 4, no web view | A web view costs 300–500 ms of startup (WebKitGTK spawns a process) and contenteditable is where Typora's editing lag comes from. GTK gives us IME, clipboard, HiDPI, accessibility and Pango text shaping for free, and it's already installed on Linux, so the binary stays at about 1 MB. |
+| Linux only | Chosen over cross-platform options such as winit + Parley. |
+| Our own renderer on Pango, not GtkTextView | Full control over layout and looks. Each block maps to a source byte range, which is what inline editing needs. |
+| pulldown-cmark | Correct and fast (5 ms for 750 KB), and it gives source offsets for every element. |
+| **GPU renderer (GTK default)** | Decided after measuring. In headless tests the Cairo renderer reached first frame in ~140 ms vs ~300–400 ms on GL, but it rasterises every frame on the CPU (8–13 ms per frame at 1000–2000 px), which risks stutter on large or HiDPI screens. Don't force `GSK_RENDERER`. |
+| Single-instance GApplication | A second launch hands the file to the running process over D-Bus. |
+| Remote images not fetched | No network code. Remote images render as link chips. |
+
+## Architecture you'll build v2 on
+
+- `doc.rs`: Markdown → `Vec<Block>`. Each block has its `kind`, a container
+  stack `conts` (quotes, lists, footnotes) used for indentation and bars, a list
+  `marker`, and **`src: Range<usize>`, its byte range in the source**.
+  Inline styling is `Rich { text, spans }`, where the text has the Markdown
+  syntax stripped.
+- `layout.rs` (`Engine`): lazy layout.
+  - Only blocks on screen are shaped. Every block has a height (estimated or
+    measured), and `ys` holds prefix sums.
+  - `measure_some()` refines estimates in 4 ms idle slices.
+  - The view anchors on (block, fraction) so changing heights never makes it jump.
+  - `invalidate_block(i)` + `ensure()` re-lays out a single block, which is the
+    hook for incremental editing.
+  - Selection is `Pos { block, part, idx }`, where `idx` indexes `Rich.text`.
+    Table cells are separate parts.
+- **Padding joiners:** inline code, kbd and badges get a U+2060 joiner at each
+  edge (given width by an `AttrShape`), so the text in a Pango layout is not
+  identical to `Rich.text`. Always convert with `Part::layout_idx` /
+  `Part::text_idx` (tested in `layout::tests`).
+- `view.rs`: `DocView` is a `GtkScrollable`.
+  - `relayout(f)` applies an engine change while keeping the scroll anchor.
+  - `sync()` lays out the visible range and updates the adjustment.
+  - Images decode on `gio::spawn_blocking`; their dimensions come from the file
+    header (`image_size`) so layout never jumps.
+- `paint.rs`: the `Painter` trait has two backends, the GTK snapshot (the app)
+  and Cairo (headless `--render`/`--bench`). Anything new you draw must go
+  through it so headless tests keep working.
+- `app.rs`: the window and actions.
+  - The startup preload parses the file on a worker thread while GTK initialises.
+  - Live reload uses a `gio::FileMonitor` with a 60 ms debounce. It handles
+    atomic rename-over saves. `set_doc(…, keep_position = true)` keeps the
+    scroll position.
+
+## Suggested v2 plan
+
+1. **Buffer:** keep the source in a rope (e.g. `ropey`). The engine owns it, and
+   blocks keep `src` ranges into it.
+2. **Typora model:** the block containing the cursor switches to a *source
+   view*: its raw Markdown is laid out with syntax markers dimmed, and inline
+   styles are still applied. All other blocks stay rendered. Moving the cursor
+   out re-renders the block.
+3. **Incremental parse:** after an edit, re-parse from the start of the edited
+   block to the next blank-line boundary (extend if a fence or list continues),
+   splice the new blocks into `doc.blocks`, shift the later `src` ranges, then
+   `invalidate_block` and `ensure`. Budget: under 2 ms per keystroke for normal
+   paragraphs. Full re-parse of a 750 KB file is 5 ms, which is an acceptable
+   fallback.
+4. **Input:** use `GtkIMContext` (IME, compose keys and dead keys), then a caret
+   with blinking and keyboard navigation (by character, word, line and block),
+   shift-selection, and undo/redo coalesced by word.
+5. **Files:** save, save-as, a dirty indicator, a prompt on close, and stopping
+   the file monitor from reloading on our own saves.
+6. **Keep the speed honest:** add per-keystroke timing to `--bench` (simulate
+   typing into a large file) and keep the scroll and paint numbers in the README.
+
+## Testing without a display
+
+The agent's shell has no display. What works:
+
+- `cargo test`: parser, highlighter, TeX, offset mapping, selection and hit-testing.
+- `folio --render out.png [--scroll Y] [--dark] [--select-all] FILE`: renders
+  through the Cairo painter, so you can look at the PNG.
+- `folio --bench FILE`: engine timings. Generate the big test file with
+  `python3 samples/gen_big.py`.
+- **Real GTK app:** `scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE`
+  runs an isolated headless GNOME Shell (its own D-Bus session) and screenshots
+  the live window. `FOLIO_SCROLL=y` and `FOLIO_FIND=text` script it.
+  `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this
+  harness is software-rendered, so GPU startup numbers are pessimistic.
+- Dead ends, don't retry: GTK's Broadway backend plus headless Chromium (new
+  headless mode screenshots before Broadway draws), and snap Chromium can't
+  write to `/tmp`.
+
+## Release
+
+CI (`.github/workflows/release.yml`) tests and builds every push. Pushing a
+`v*` tag publishes a GitHub Release with an x86_64 tarball. Bump
+`Cargo.toml`'s version first. The repo (`nikosk/folio`) is private. Each run
+spends ~10 minutes installing GTK, which counts against the Actions minutes.
+
+## Known v1 limitations
+
+- Math is TeX converted to Unicode, which is fine inline but not for matrices
+  or complex layout.
+- No outline sidebar, print or export.
+- The default window size of 940×1000 may be too tall for small laptop screens.

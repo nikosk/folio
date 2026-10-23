@@ -1,8 +1,10 @@
-# Hand-off: Folio v1 → v2
+# Hand-off: Folio v2 (editing)
 
 Folio is a fast, Typora-style Markdown app for Linux. v1, the viewer, shipped
-as `v0.1.0`. v2 adds Typora-style inline editing. Read `README.md` first for
-features, keys and the file map; this document covers what the code doesn't say.
+as `v0.1.0`. v2 adds Typora-style inline editing; its first working version
+is on the `v2-editing` branch (see "v2 status" below). Read `README.md` first
+for features, keys and the file map; this document covers what the code
+doesn't say.
 
 ## Goals, in priority order
 
@@ -23,7 +25,62 @@ features, keys and the file map; this document covers what the code doesn't say.
 | Single-instance GApplication | A second launch hands the file to the running process over D-Bus. |
 | Remote images not fetched | No network code. Remote images render as link chips. |
 
-## Architecture you'll build v2 on
+## v2 status
+
+Done, tested, measured: editing with a source view of the block under the
+caret, incremental re-parse, caret/selection/keyboard navigation, IME via
+`GtkIMContext`, undo/redo by word, cut/copy/paste, save/save as/new, dirty
+title marker, close prompt, own saves not reloaded, `--bench` typing timings
+(0.42 ms median per keystroke on the 750 KB file, 1.7 ms max).
+
+How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
+
+- **The buffer is a `String`**, not a rope (deviation from the plan below):
+  pulldown-cmark needs a contiguous `&str` to re-parse, and inserting into
+  750 KB is a ~20 µs memmove. Measured, not guessed; revisit only if `--bench`
+  says so.
+- **Caret and selection are byte offsets** into the source (`EditState`);
+  `Engine::caret`/`sel` (`Pos`) are derived for painting.
+- **Source map:** every block has `map: [part, text offset, source offset]`
+  runs (source relative to `src.start`), so `Block::text_to_src` /
+  `src_to_text` convert rendered positions both ways (clicks on rendered
+  text land on the right source byte).
+- **The active block is a real block**, `Kind::Source { rich, style }`,
+  spliced into `doc.blocks` in place of the rendered block(s); the rendered
+  ones are stashed and put back when the caret leaves. So layout, hit-testing
+  and selection need no special cases. Its text is the raw source, styled by
+  `doc::source_kind` (syntax gets `st::SYNTAX`, drawn in `theme.syntax_mark`).
+  A caret between blocks (after Enter) gets an empty synthetic source block.
+- **Every edit:** un-stash → change text → re-parse region → re-activate.
+  The region is the touched blocks plus one top-level container run on each
+  side, widened until bounded by blank lines (lazy continuation and setext
+  underlines cross single newlines). Unchanged blocks keep their layout
+  (`splice_reuse`). Full re-parse fallback when the doc has footnotes or link
+  reference definitions (`Doc::global`), when the edit text is "risky" (HTML
+  comment/pre/script, `]:`, `[^`), when front matter may change, or when the
+  last untouched block of the region parses differently (e.g. an unclosed
+  fence). The randomized test `editor::fuzz` checks the result against a
+  fresh parse after every edit; run it with more seeds after parser changes.
+- **Front matter** is detected by Folio itself, only at offset 0: pulldown-
+  cmark's metadata option also matched `---` + text … `---` mid-document,
+  swallowing everything in between (a v1 bug, now fixed).
+- **Reading mode:** with no caret (on open, or after `Esc`) the v1 scroll
+  keys work; a click starts editing. While editing, links need Ctrl+click.
+
+Next steps, roughly in priority order:
+
+1. Show the image under its source while an image block is active; tables
+   edited cell by cell instead of as raw text.
+2. List indent/outdent on Tab/Shift+Tab; renumber ordered lists after edits.
+3. Typing in documents with footnotes or link definitions re-parses
+   everything (~5 ms on 750 KB); make footnotes/refs incremental if that
+   matters in practice.
+4. The source view of a heading or paragraph appears instantly on click and
+   can shift text horizontally (syntax becomes visible); consider a short
+   transition or keeping the click point fixed.
+5. Rich-text copy (HTML) alongside Markdown; a release (bump `Cargo.toml`).
+
+## Architecture
 
 - `doc.rs`: Markdown → `Vec<Block>`. Each block has its `kind`, a container
   stack `conts` (quotes, lists, footnotes) used for indentation and bars, a list
@@ -57,7 +114,7 @@ features, keys and the file map; this document covers what the code doesn't say.
     atomic rename-over saves. `set_doc(…, keep_position = true)` keeps the
     scroll position.
 
-## Suggested v2 plan
+## Original v2 plan (from v1; mostly done, see "v2 status")
 
 1. **Buffer:** keep the source in a rope (e.g. `ropey`). The engine owns it, and
    blocks keep `src` ranges into it.
@@ -91,6 +148,13 @@ The agent's shell has no display. What works:
 - **Real GTK app:** `scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE`
   runs an isolated headless GNOME Shell (its own D-Bus session) and screenshots
   the live window. `FOLIO_SCROLL=y` and `FOLIO_FIND=text` script it.
+- **Typing and clicking in the real app:** `scripts/drive.py` injects key and
+  pointer events through Mutter's RemoteDesktop D-Bus API (so the input method
+  path is exercised) and screenshots after `DELAY` ms. One D-Bus connection
+  must hold the session (separate `gdbus call`s lose it), and a button press
+  needs a short pause before its release.
+- `folio --render out.png --caret OFFSET FILE` renders with the source view of
+  the block at OFFSET.
   `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this
   harness is software-rendered, so GPU startup numbers are pessimistic.
 - Dead ends, don't retry: GTK's Broadway backend plus headless Chromium (new

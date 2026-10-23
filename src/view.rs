@@ -1,8 +1,9 @@
 //! The document widget: a GtkScrollable that draws the engine's output with
-//! GTK's GPU renderer and handles selection, links and keyboard scrolling.
+//! GTK's GPU renderer and handles editing input, selection, links and
+//! keyboard scrolling.
 
 use crate::doc::Doc;
-use crate::layout::{Engine, Img, Pos};
+use crate::layout::{Engine, Img};
 use crate::paint::{Painter, SnapPainter};
 use crate::theme::{Theme, BODY_FONT};
 use gtk::gdk::{self, Key, ModifierType};
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 type LinkHandler = Box<dyn Fn(&str)>;
+type ChangeHandler = Box<dyn Fn()>;
 
 mod imp {
     use super::*;
@@ -35,8 +37,14 @@ mod imp {
         pub drag_pt: Cell<(f64, f64)>,
         pub autoscroll: RefCell<Option<glib::SourceId>>,
         pub cursor: Cell<u8>,
+        /// Whether Ctrl was held at the last key event (link hover cursor).
+        pub cursor_ctrl: Cell<bool>,
         pub on_link: RefCell<Option<LinkHandler>>,
+        pub on_change: RefCell<Option<ChangeHandler>>,
         pub first_frame: Cell<bool>,
+        pub im: gtk::IMMulticontext,
+        pub blink: RefCell<Option<glib::SourceId>>,
+        pub version: Cell<u64>,
     }
 
     impl Default for DocView {
@@ -57,8 +65,13 @@ mod imp {
                 drag_pt: Cell::new((0.0, 0.0)),
                 autoscroll: RefCell::new(None),
                 cursor: Cell::new(0),
+                cursor_ctrl: Cell::new(false),
                 on_link: RefCell::new(None),
+                on_change: RefCell::new(None),
                 first_frame: Cell::new(true),
+                im: gtk::IMMulticontext::new(),
+                blink: RefCell::new(None),
+                version: Cell::new(0),
             }
         }
     }
@@ -185,14 +198,14 @@ impl DocView {
 
     /// Replace the document. With `keep_position`, the scroll position is
     /// carried over by block index (used for live reload).
-    pub fn set_doc(&self, doc: Doc, base_dir: PathBuf, keep_position: bool) {
+    pub fn set_doc(&self, src: String, doc: Doc, base_dir: PathBuf, keep_position: bool) {
         let imp = self.imp();
         let anchor = match (keep_position, imp.eng.borrow_mut().as_mut()) {
             (true, Some(e)) => Some(e.anchor(self.top())),
             _ => None,
         };
         let theme = imp.theme.borrow().clone();
-        let mut e = Engine::new(self.pango_context(), doc, base_dir, theme, imp.zoom.get());
+        let mut e = Engine::new(self.pango_context(), src, doc, base_dir, theme, imp.zoom.get());
         e.set_width(self.width().max(1) as f64);
         // Keep already-decoded images across reloads.
         if let Some(old) = imp.eng.borrow_mut().as_mut() {
@@ -202,8 +215,46 @@ impl DocView {
                 .collect();
         }
         *imp.eng.borrow_mut() = Some(e);
+        imp.version.set(0);
         self.sync(Some(anchor.unwrap_or((0, 0.0))));
         self.queue_draw();
+    }
+
+    /// An empty, untitled document with the caret in it.
+    pub fn set_empty(&self) {
+        self.set_doc(String::new(), Doc::default(), std::env::current_dir().unwrap_or_default(), false);
+        self.with_edit(|e| e.set_caret(0, false, true));
+    }
+
+    pub fn source(&self) -> Option<String> {
+        self.imp().eng.borrow().as_ref().map(|e| e.src.clone())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.imp().eng.borrow().as_ref().is_some_and(|e| e.is_dirty())
+    }
+
+    pub fn mark_saved(&self) {
+        if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
+            e.mark_saved();
+        }
+        self.notify_change();
+    }
+
+    pub fn set_base_dir(&self, dir: PathBuf) {
+        if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
+            e.base_dir = dir;
+        }
+    }
+
+    pub fn connect_change<F: Fn() + 'static>(&self, f: F) {
+        *self.imp().on_change.borrow_mut() = Some(Box::new(f));
+    }
+
+    fn notify_change(&self) {
+        if let Some(f) = self.imp().on_change.borrow().as_ref() {
+            f();
+        }
     }
 
     pub fn has_doc(&self) -> bool {
@@ -408,14 +459,16 @@ impl DocView {
     // ---- selection & clipboard -------------------------------------------
 
     pub fn copy(&self) {
-        let text = self.imp().eng.borrow().as_ref().map(|e| e.selected_text()).unwrap_or_default();
+        let text = self.imp().eng.borrow().as_ref().map(|e| if e.editing() { e.selected_source() } else { e.selected_text() }).unwrap_or_default();
         if !text.is_empty() {
             self.clipboard().set_text(&text);
         }
     }
 
     pub fn select_all(&self) {
-        if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
+        if self.editing() {
+            self.with_edit(|e| e.select_all_text());
+        } else if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
             e.select_all();
         }
         self.update_primary();
@@ -423,15 +476,219 @@ impl DocView {
     }
 
     fn update_primary(&self) {
-        let text = self.imp().eng.borrow().as_ref().map(|e| e.selected_text()).unwrap_or_default();
+        let text = self.imp().eng.borrow().as_ref().map(|e| if e.editing() { e.selected_source() } else { e.selected_text() }).unwrap_or_default();
         if !text.is_empty() {
             self.primary_clipboard().set_text(&text);
         }
     }
 
-    fn hit(&self, x: f64, y: f64) -> Option<Pos> {
+    /// Source offset under a widget point.
+    fn hit_off(&self, x: f64, y: f64) -> Option<usize> {
         let top = self.top();
-        self.imp().eng.borrow_mut().as_mut()?.hit(x, y + top).map(|h| h.0)
+        let mut eng = self.imp().eng.borrow_mut();
+        let e = eng.as_mut()?;
+        let (p, _) = e.hit(x, y + top)?;
+        Some(e.pos_to_off(p))
+    }
+
+    // ---- editing -----------------------------------------------------------
+
+    fn editing(&self) -> bool {
+        self.imp().eng.borrow().as_ref().is_some_and(|e| e.editing())
+    }
+
+    /// Run an editing operation, then keep the caret in view, restart the
+    /// blink and tell the window if the text changed.
+    fn with_edit(&self, f: impl FnOnce(&mut Engine)) {
+        let imp = self.imp();
+        let version = {
+            let mut eng = imp.eng.borrow_mut();
+            let Some(e) = eng.as_mut() else { return };
+            f(e);
+            e.caret_on = true;
+            e.ed.version
+        };
+        self.sync(None);
+        self.scroll_to_caret();
+        self.restart_blink();
+        self.update_im_cursor();
+        self.queue_draw();
+        if imp.version.replace(version) != version {
+            self.notify_change();
+        }
+    }
+
+    fn scroll_to_caret(&self) {
+        let h = self.height() as f64;
+        let top = self.top();
+        let rect = {
+            let mut eng = self.imp().eng.borrow_mut();
+            let Some(e) = eng.as_mut() else { return };
+            let Some(p) = e.caret_pos() else { return };
+            let em = e.em();
+            e.caret_rect(p).map(|r| (r, em))
+        };
+        let Some(((_, y, ch), em)) = rect else { return };
+        let margin = (1.5 * em).min(h / 4.0);
+        if y < top + margin {
+            self.scroll_to(y - margin);
+        } else if y + ch > top + h - margin {
+            self.scroll_to(y + ch + margin - h);
+        }
+    }
+
+    fn update_im_cursor(&self) {
+        let top = self.top();
+        let rect = {
+            let mut eng = self.imp().eng.borrow_mut();
+            eng.as_mut().and_then(|e| e.caret_pos().and_then(|p| e.caret_rect(p)))
+        };
+        if let Some((x, y, h)) = rect {
+            let r = gdk::Rectangle::new(x as i32, (y - top) as i32, 1, h as i32);
+            self.imp().im.set_cursor_location(&r);
+        }
+    }
+
+    fn restart_blink(&self) {
+        let imp = self.imp();
+        if let Some(id) = imp.blink.take() {
+            id.remove();
+        }
+        let settings = gtk::Settings::default();
+        let on = settings.as_ref().is_none_or(|s| s.is_gtk_cursor_blink());
+        if !on || !self.editing() || !self.has_focus() {
+            return;
+        }
+        let cycle = settings.as_ref().map_or(1200, |s| s.gtk_cursor_blink_time()).max(200) as u64;
+        let timeout = settings.as_ref().map_or(10, |s| s.gtk_cursor_blink_timeout()).max(1) as u64;
+        let ticks = Cell::new(0u64);
+        let id = glib::timeout_add_local(Duration::from_millis(cycle / 2), clone!(
+            #[weak(rename_to = obj)]
+            self,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                let n = ticks.get() + 1;
+                ticks.set(n);
+                // Stop blinking (caret shown) after the idle timeout, like GTK.
+                let stop = n * cycle / 2 >= timeout * 1000;
+                if let Some(e) = obj.imp().eng.borrow_mut().as_mut() {
+                    e.caret_on = stop || !e.caret_on;
+                }
+                obj.queue_draw();
+                if stop {
+                    obj.imp().blink.take();
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            }
+        ));
+        *imp.blink.borrow_mut() = Some(id);
+    }
+
+    pub fn undo(&self) {
+        self.with_edit(|e| {
+            e.undo();
+        });
+    }
+
+    pub fn redo(&self) {
+        self.with_edit(|e| {
+            e.redo();
+        });
+    }
+
+    pub fn cut(&self) {
+        let text = self.imp().eng.borrow().as_ref().map(|e| e.selected_source()).unwrap_or_default();
+        if !text.is_empty() {
+            self.clipboard().set_text(&text);
+            self.with_edit(|e| {
+                e.delete_selection();
+            });
+        }
+    }
+
+    pub fn paste(&self) {
+        if !self.editing() {
+            return;
+        }
+        let obj = self.downgrade();
+        let clip = self.clipboard();
+        glib::spawn_future_local(async move {
+            if let (Ok(Some(text)), Some(obj)) = (clip.read_text_future().await, obj.upgrade()) {
+                obj.with_edit(|e| e.insert(&text));
+            }
+        });
+    }
+
+    /// Wrap the selection in `mark` (e.g. `**`), or insert a pair at the caret.
+    fn wrap(&self, mark: &str) {
+        self.with_edit(|e| {
+            let sel = e.selection();
+            let text = e.selected_source();
+            let caret = e.ed.caret.unwrap_or(0);
+            e.insert(&format!("{mark}{text}{mark}"));
+            match sel {
+                Some(r) => e.select_range(r.start + mark.len()..r.end + mark.len()),
+                None => e.set_caret(caret + mark.len(), false, true),
+            }
+        });
+    }
+
+    fn insert_text(&self, text: &str) {
+        if self.editing() {
+            self.with_edit(|e| e.insert(text));
+        }
+    }
+
+    /// The key press, handled as an editing command. Returns false if unused.
+    fn on_edit_key(&self, key: Key, state: ModifierType) -> bool {
+        let ctrl = state.contains(ModifierType::CONTROL_MASK);
+        let shift = state.contains(ModifierType::SHIFT_MASK);
+        let page = self.height() as f64 * 0.9;
+        match key {
+            Key::z | Key::Z if ctrl && shift => self.redo(),
+            Key::z if ctrl => self.undo(),
+            Key::y if ctrl => self.redo(),
+            Key::x if ctrl => self.cut(),
+            Key::v if ctrl => self.paste(),
+            Key::b if ctrl => self.wrap("**"),
+            Key::i if ctrl => self.wrap("*"),
+            Key::Left | Key::KP_Left => self.with_edit(|e| e.move_h(false, ctrl, shift)),
+            Key::Right | Key::KP_Right => self.with_edit(|e| e.move_h(true, ctrl, shift)),
+            Key::Up | Key::KP_Up => self.with_edit(|e| e.move_v(false, shift)),
+            Key::Down | Key::KP_Down => self.with_edit(|e| e.move_v(true, shift)),
+            Key::Home | Key::KP_Home if ctrl => self.with_edit(|e| e.set_caret(0, shift, true)),
+            Key::End | Key::KP_End if ctrl => self.with_edit(|e| e.set_caret(e.src.len(), shift, true)),
+            Key::Home | Key::KP_Home => self.with_edit(|e| e.move_line_edge(false, shift)),
+            Key::End | Key::KP_End => self.with_edit(|e| e.move_line_edge(true, shift)),
+            Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down => {
+                let dy = if matches!(key, Key::Page_Up | Key::KP_Page_Up) { -page } else { page };
+                self.scroll_by(dy);
+                self.with_edit(|e| {
+                    let Some(p) = e.caret_pos() else { return };
+                    if let Some((x, y, h)) = e.caret_rect(p)
+                        && let Some((t, _)) = e.hit(x, y + h / 2.0 + dy) {
+                            let off = e.pos_to_off(t);
+                            e.set_caret(off, shift, true);
+                        }
+                });
+            }
+            Key::BackSpace => self.with_edit(|e| e.backspace(ctrl)),
+            Key::Delete | Key::KP_Delete => self.with_edit(|e| e.delete_forward(ctrl)),
+            Key::Return | Key::KP_Enter | Key::ISO_Enter => self.with_edit(|e| e.newline(shift)),
+            Key::Tab | Key::KP_Tab => self.with_edit(|e| e.insert("    ")),
+            Key::Escape => {
+                self.with_edit(|e| e.clear_caret());
+                self.restart_blink();
+            }
+            _ => return false,
+        }
+        if shift {
+            self.update_primary();
+        }
+        true
     }
 
     fn setup_input(&self) {
@@ -467,6 +724,9 @@ impl DocView {
                 if let Some(id) = obj.imp().autoscroll.take() {
                     id.remove();
                 }
+                if obj.imp().dragged.get() {
+                    obj.with_edit(|e| e.settle());
+                }
             }
         ));
         self.add_controller(drag);
@@ -479,15 +739,82 @@ impl DocView {
         ));
         self.add_controller(motion);
 
+        let im = &self.imp().im;
+        im.set_client_widget(Some(self));
+        im.connect_commit(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |_, text| obj.insert_text(text)
+        ));
+        im.connect_preedit_changed(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |im| {
+                let (text, _, _) = im.preedit_string();
+                if let Some(e) = obj.imp().eng.borrow_mut().as_mut() {
+                    e.preedit = text.to_string();
+                }
+                obj.queue_draw();
+            }
+        ));
+
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed(clone!(
             #[weak(rename_to = obj)]
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, key, _, state| obj.on_key(key, state)
+            move |c, key, _, state| {
+                // Text goes through the input method first (compose keys, IME).
+                if obj.editing()
+                    && let Some(ev) = c.current_event()
+                    && obj.imp().im.filter_keypress(&ev)
+                {
+                    return glib::Propagation::Stop;
+                }
+                obj.on_key(key, state)
+            }
+        ));
+        keys.connect_key_released(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |c, key, _, _| {
+                if matches!(key, Key::Control_L | Key::Control_R) {
+                    obj.imp().cursor_ctrl.set(false);
+                }
+                if obj.editing()
+                    && let Some(ev) = c.current_event()
+                {
+                    obj.imp().im.filter_keypress(&ev);
+                }
+            }
         ));
         self.add_controller(keys);
+
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_enter(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |_| {
+                obj.imp().im.focus_in();
+                obj.restart_blink();
+            }
+        ));
+        focus.connect_leave(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |_| {
+                obj.imp().im.focus_out();
+                if let Some(id) = obj.imp().blink.take() {
+                    id.remove();
+                }
+                if let Some(e) = obj.imp().eng.borrow_mut().as_mut() {
+                    e.caret_on = false;
+                }
+                obj.queue_draw();
+            }
+        ));
+        self.add_controller(focus);
 
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll(clone!(
@@ -513,23 +840,41 @@ impl DocView {
         imp.press.set(Some((x, y)));
         imp.dragged.set(false);
         imp.clicks.set(n);
-        let Some(pos) = self.hit(x, y) else { return };
-        if let Some(e) = imp.eng.borrow_mut().as_mut() {
-            e.sel = Some(match n {
-                1 if state.contains(ModifierType::SHIFT_MASK) => (e.sel.map_or(pos, |s| s.0), pos),
-                1 => (pos, pos),
-                2 => e.word_at(pos),
-                _ => e.block_range(pos),
-            });
+        let top = self.top();
+        // Ctrl+click follows a link instead of placing the caret.
+        if state.contains(ModifierType::CONTROL_MASK) {
+            let link = imp.eng.borrow_mut().as_mut().and_then(|e| e.link_at(x, y + top));
+            if let Some(url) = link {
+                imp.clicks.set(0);
+                self.follow_link(&url);
+                return;
+            }
         }
-        if n > 1 {
+        let Some(off) = self.hit_off(x, y) else { return };
+        let shift = state.contains(ModifierType::SHIFT_MASK);
+        self.with_edit(|e| match n {
+            1 => e.set_caret(off, shift, true),
+            2 => e.select_word_at(off),
+            _ => e.select_block_at(off),
+        });
+        if n > 1 || shift {
             self.update_primary();
         }
-        self.queue_draw();
+    }
+
+    fn follow_link(&self, url: &str) {
+        if let Some(anchor) = url.strip_prefix('#') {
+            self.scroll_to_anchor(anchor);
+        } else if let Some(f) = self.imp().on_link.borrow().as_ref() {
+            f(url);
+        }
     }
 
     fn on_drag(&self, x: f64, y: f64) {
         let imp = self.imp();
+        if imp.clicks.get() == 0 {
+            return;
+        }
         if let Some((px, py)) = imp.press.get()
             && (x - px).hypot(y - py) > 3.0 {
                 imp.dragged.set(true);
@@ -566,47 +911,29 @@ impl DocView {
 
     fn extend_selection(&self, x: f64, y: f64) {
         let h = self.height() as f64;
-        let Some(pos) = self.hit(x, y.clamp(0.0, h)) else { return };
-        if let Some(e) = self.imp().eng.borrow_mut().as_mut()
-            && let Some(sel) = &mut e.sel {
-                sel.1 = pos;
-            }
+        let Some(off) = self.hit_off(x, y.clamp(0.0, h)) else { return };
+        // The source view stays where it is while dragging, so the text
+        // under the pointer doesn't move.
+        if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
+            e.set_caret(off, true, false);
+            e.caret_on = true;
+        }
         self.queue_draw();
     }
 
-    fn on_release(&self, x: f64, y: f64) {
-        let imp = self.imp();
-        if imp.dragged.get() {
+    fn on_release(&self, _x: f64, _y: f64) {
+        if self.imp().dragged.get() {
             self.update_primary();
-            return;
-        }
-        if imp.clicks.get() != 1 {
-            return;
-        }
-        let top = self.top();
-        let link = {
-            let mut eng = imp.eng.borrow_mut();
-            let Some(e) = eng.as_mut() else { return };
-            if e.sel.is_some_and(|(a, b)| a == b) {
-                e.sel = None;
-            }
-            e.link_at(x, y + top)
-        };
-        self.queue_draw();
-        if let Some(url) = link {
-            if let Some(anchor) = url.strip_prefix('#') {
-                self.scroll_to_anchor(anchor);
-            } else if let Some(f) = imp.on_link.borrow().as_ref() {
-                f(&url);
-            }
         }
     }
 
     fn on_motion(&self, x: f64, y: f64) {
         let top = self.top();
+        let ctrl = self.imp().cursor_ctrl.get();
         let kind = match self.imp().eng.borrow_mut().as_mut() {
             Some(e) => {
-                if e.link_at(x, y + top).is_some() {
+                // While editing, links open with Ctrl+click.
+                if (ctrl || !e.editing()) && e.link_at(x, y + top).is_some() {
                     CURSOR_POINTER
                 } else if e.over_text(x, y + top) {
                     CURSOR_TEXT
@@ -628,6 +955,23 @@ impl DocView {
     fn on_key(&self, key: Key, state: ModifierType) -> glib::Propagation {
         let ctrl = state.contains(ModifierType::CONTROL_MASK);
         let shift = state.contains(ModifierType::SHIFT_MASK);
+        self.imp().cursor_ctrl.set(ctrl || matches!(key, Key::Control_L | Key::Control_R));
+        if self.editing() {
+            if self.on_edit_key(key, state) {
+                return glib::Propagation::Stop;
+            }
+            return match key {
+                Key::c | Key::C | Key::Insert if ctrl => {
+                    self.copy();
+                    glib::Propagation::Stop
+                }
+                Key::a | Key::A if ctrl => {
+                    self.select_all();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            };
+        }
         let h = self.height() as f64;
         let line = 3.0 * 16.0 * self.zoom();
         match key {

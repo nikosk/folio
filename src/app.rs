@@ -15,7 +15,7 @@ use std::time::Duration;
 
 const APP_ID: &str = "dev.folio.Folio";
 
-type Preload = (PathBuf, JoinHandle<std::io::Result<Doc>>);
+type Preload = (PathBuf, JoinHandle<std::io::Result<(String, Doc)>>);
 
 /// A document parsed on a worker thread while GTK initialises.
 static PRELOAD: Mutex<Option<Preload>> = Mutex::new(None);
@@ -23,18 +23,24 @@ static PRELOAD: Mutex<Option<Preload>> = Mutex::new(None);
 pub fn preload(path: &Path) {
     let Ok(path) = path.canonicalize() else { return };
     let p = path.clone();
-    let handle = std::thread::spawn(move || std::fs::read_to_string(&p).map(|s| doc::parse(&s)));
+    let handle = std::thread::spawn(move || read_doc(&p));
     *PRELOAD.lock().unwrap() = Some((path, handle));
 }
 
-fn load(path: &Path) -> std::io::Result<Doc> {
+fn read_doc(path: &Path) -> std::io::Result<(String, Doc)> {
+    let bytes = std::fs::read(path)?;
+    let src = String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let doc = doc::parse(&src);
+    Ok((src, doc))
+}
+
+fn load(path: &Path) -> std::io::Result<(String, Doc)> {
     let pre = PRELOAD.lock().unwrap().take();
     if let Some((p, handle)) = pre
         && p == path {
             return handle.join().unwrap_or_else(|_| Err(std::io::Error::other("parser panicked")));
         }
-    let bytes = std::fs::read(path)?;
-    Ok(doc::parse(&String::from_utf8_lossy(&bytes)))
+    read_doc(path)
 }
 
 struct State {
@@ -123,18 +129,31 @@ fn startup(app: &gtk::Application) {
     let toggle = gio::SimpleAction::new("toggle-theme", None);
     toggle.connect_activate(|_, _| apply_theme(!state().dark.get()));
     app.add_action(&toggle);
+    // Closing each window gives unsaved documents a chance to be saved.
     let quit = gio::SimpleAction::new("quit", None);
-    quit.connect_activate(clone!(
+    quit.connect_activate(|_, _| {
+        for w in state().windows.borrow().iter().filter_map(Weak::upgrade) {
+            w.win.close();
+        }
+    });
+    app.add_action(&quit);
+    let new = gio::SimpleAction::new("new", None);
+    new.connect_activate(clone!(
         #[weak]
         app,
-        move |_, _| app.quit()
+        move |_, _| {
+            Win::new(&app, None);
+        }
     ));
-    app.add_action(&quit);
+    app.add_action(&new);
 
     for (action, accels) in [
         ("app.quit", &["<Ctrl>q"][..]),
         ("app.toggle-theme", &["<Ctrl>d"]),
+        ("app.new", &["<Ctrl>n"]),
         ("win.open", &["<Ctrl>o"]),
+        ("win.save", &["<Ctrl>s"]),
+        ("win.save-as", &["<Ctrl><Shift>s"]),
         ("win.close", &["<Ctrl>w"]),
         ("win.find", &["<Ctrl>f"]),
         ("win.find-next", &["<Ctrl>g", "F3"]),
@@ -161,6 +180,8 @@ struct Win {
     history: RefCell<Vec<PathBuf>>,
     monitor: RefCell<Option<gio::FileMonitor>>,
     reload_timer: RefCell<Option<glib::SourceId>>,
+    /// Set once the user chose to close despite unsaved changes.
+    closing: Cell<bool>,
 }
 
 impl Win {
@@ -189,6 +210,10 @@ impl Win {
         open.set_tooltip_text(Some("Open… (Ctrl+O)"));
         open.set_action_name(Some("win.open"));
         header.pack_start(&open);
+        let new = gtk::Button::from_icon_name("document-new-symbolic");
+        new.set_tooltip_text(Some("New (Ctrl+N)"));
+        new.set_action_name(Some("app.new"));
+        header.pack_start(&new);
         let theme_btn = gtk::Button::from_icon_name("weather-clear-night-symbolic");
         theme_btn.set_tooltip_text(Some("Toggle dark mode (Ctrl+D)"));
         theme_btn.set_action_name(Some("app.toggle-theme"));
@@ -229,7 +254,6 @@ impl Win {
         win.set_titlebar(Some(&header));
         win.set_child(Some(&vbox));
         view.set_theme(theme());
-        view.set_message("Open a Markdown file with Ctrl+O, or drop one here.");
 
         let w = Rc::new(Win {
             win,
@@ -243,19 +267,25 @@ impl Win {
             history: RefCell::new(Vec::new()),
             monitor: RefCell::new(None),
             reload_timer: RefCell::new(None),
+            closing: Cell::new(false),
         });
         state().windows.borrow_mut().push(Rc::downgrade(&w));
         w.setup_actions();
         w.setup_search();
         w.setup_drop();
         w.setup_links();
+        w.setup_editing();
         // The window owns the Rc through this handler and drops it on close.
         let keep = RefCell::new(Some(w.clone()));
         w.win.connect_destroy(move |_| {
             keep.borrow_mut().take();
         });
-        if let Some(p) = path {
-            w.open(p, false);
+        match path {
+            Some(p) => w.open(p, false),
+            None => {
+                w.view.set_empty();
+                w.update_titles();
+            }
         }
         crate::mark("window built, document loaded");
         w.win.present();
@@ -268,10 +298,12 @@ impl Win {
     }
 
     /// Debug hook: FOLIO_SCREENSHOT=out.png [FOLIO_SCROLL=y] [FOLIO_FIND=text]
-    /// renders the live window with GTK's renderer, saves it and exits.
+    /// [FOLIO_DELAY=ms] renders the live window with GTK's renderer, saves it
+    /// and exits. FOLIO_DELAY leaves time for scripted input.
     fn debug_screenshot(self: &Rc<Self>, out: String) {
         let w = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(600), move || {
+        let delay = std::env::var("FOLIO_DELAY").ok().and_then(|d| d.parse().ok()).unwrap_or(600);
+        glib::timeout_add_local_once(Duration::from_millis(delay), move || {
             if let Ok(q) = std::env::var("FOLIO_FIND") {
                 w.search.set_search_mode(true);
                 w.entry.set_text(&q);
@@ -308,6 +340,8 @@ impl Win {
 
     fn setup_actions(self: &Rc<Self>) {
         self.action("open", |w| w.open_dialog());
+        self.action("save", |w| w.save(|_| {}));
+        self.action("save-as", |w| w.save_as(|_| {}));
         self.action("close", |w| w.win.close());
         self.action("find", |w| {
             w.search.set_search_mode(true);
@@ -457,7 +491,14 @@ impl Win {
 
     fn open(self: &Rc<Self>, path: PathBuf, push_history: bool) {
         let path = path.canonicalize().unwrap_or(path);
-        let doc = match load(&path) {
+        // Never replace unsaved work: open elsewhere instead.
+        if self.view.is_dirty() && self.path.borrow().as_ref() != Some(&path) {
+            if let Some(app) = self.win.application() {
+                Win::new(&app, Some(path));
+            }
+            return;
+        }
+        let (src, doc) = match load(&path) {
             Ok(d) => d,
             Err(e) => {
                 let msg = format!("Could not open {}\n{e}", path.display());
@@ -475,8 +516,8 @@ impl Win {
                 self.history.borrow_mut().push(old);
             }
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.view.set_doc(doc, base, false);
-        self.update_titles(&path);
+        self.view.set_doc(src, doc, base, false);
+        self.update_titles();
         self.watch(&path);
         self.refresh_search();
     }
@@ -484,11 +525,136 @@ impl Win {
     fn reload(self: &Rc<Self>) {
         let Some(path) = self.path.borrow().clone() else { return };
         // Mid-save files can briefly be missing or empty; keep the old view then.
-        let Ok(bytes) = std::fs::read(&path) else { return };
-        let doc = doc::parse(&String::from_utf8_lossy(&bytes));
+        let Ok((src, doc)) = read_doc(&path) else { return };
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.view.set_doc(doc, base, true);
+        self.view.set_doc(src, doc, base, true);
+        self.update_titles();
         self.refresh_search();
+    }
+
+    /// The file changed on disk: reload, unless it is our own save or
+    /// there are unsaved edits (then ask).
+    fn on_disk_change(self: &Rc<Self>) {
+        let Some(path) = self.path.borrow().clone() else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        if self.view.source().is_some_and(|s| s.as_bytes() == bytes) {
+            return;
+        }
+        if !self.view.is_dirty() {
+            return self.reload();
+        }
+        let dialog = gtk::AlertDialog::builder()
+            .message("File changed on disk")
+            .detail("It was changed by another program. Reload it and lose your unsaved changes?")
+            .buttons(["Keep Mine", "Reload"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let weak = Rc::downgrade(self);
+        dialog.choose(Some(&self.win), gio::Cancellable::NONE, move |r| {
+            if let (Some(w), Ok(1)) = (weak.upgrade(), r) {
+                w.reload();
+            }
+        });
+    }
+
+    fn setup_editing(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.view.connect_change(move || {
+            if let Some(w) = weak.upgrade() {
+                w.update_titles();
+                w.refresh_search();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.win.connect_close_request(move |win| {
+            let Some(w) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if w.closing.get() || !w.view.is_dirty() {
+                return glib::Propagation::Proceed;
+            }
+            let name = w.display_name();
+            let dialog = gtk::AlertDialog::builder()
+                .message(format!("Save changes to “{name}”?"))
+                .detail("Your changes will be lost if you don't save them.")
+                .buttons(["Cancel", "Discard", "Save"])
+                .cancel_button(0)
+                .default_button(2)
+                .modal(true)
+                .build();
+            let weak = Rc::downgrade(&w);
+            dialog.choose(Some(win), gio::Cancellable::NONE, move |r| {
+                let Some(w) = weak.upgrade() else { return };
+                match r {
+                    Ok(1) => {
+                        w.closing.set(true);
+                        w.win.close();
+                    }
+                    Ok(2) => w.save(|w| {
+                        w.closing.set(true);
+                        w.win.close();
+                    }),
+                    _ => {}
+                }
+            });
+            glib::Propagation::Stop
+        });
+    }
+
+    /// Save to the current file (or ask for one); `then` runs on success.
+    fn save(self: &Rc<Self>, then: impl Fn(&Rc<Win>) + 'static) {
+        let Some(path) = self.path.borrow().clone() else { return self.save_as(then) };
+        if self.write(&path) {
+            then(self);
+        }
+    }
+
+    fn save_as(self: &Rc<Self>, then: impl Fn(&Rc<Win>) + 'static) {
+        let dialog = gtk::FileDialog::builder().title("Save Markdown").modal(true).build();
+        match self.path.borrow().as_ref() {
+            Some(p) => dialog.set_initial_file(Some(&gio::File::for_path(p))),
+            None => dialog.set_initial_name(Some("Untitled.md")),
+        }
+        let weak = Rc::downgrade(self);
+        dialog.save(Some(&self.win), gio::Cancellable::NONE, move |res| {
+            let (Some(w), Ok(file)) = (weak.upgrade(), res) else { return };
+            let Some(path) = file.path() else { return };
+            if w.write(&path) {
+                let path = path.canonicalize().unwrap_or(path);
+                w.view.set_base_dir(path.parent().map(Path::to_path_buf).unwrap_or_default());
+                *w.path.borrow_mut() = Some(path.clone());
+                w.watch(&path);
+                w.update_titles();
+                then(&w);
+            }
+        });
+    }
+
+    /// Write the document atomically (temp file + rename, keeping permissions).
+    fn write(&self, path: &Path) -> bool {
+        let Some(src) = self.view.source() else { return false };
+        let file = gio::File::for_path(path);
+        match file.replace_contents(src.as_bytes(), None, false, gio::FileCreateFlags::NONE, gio::Cancellable::NONE) {
+            Ok(_) => {
+                self.view.mark_saved();
+                true
+            }
+            Err(e) => {
+                gtk::AlertDialog::builder()
+                    .message("Could not save file")
+                    .detail(format!("{}\n{e}", path.display()))
+                    .build()
+                    .show(Some(&self.win));
+                false
+            }
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self.path.borrow().as_ref() {
+            Some(p) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into()),
+            None => "Untitled".into(),
+        }
     }
 
     fn refresh_search(&self) {
@@ -498,17 +664,19 @@ impl Win {
         }
     }
 
-    fn update_titles(&self, path: &Path) {
-        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into());
-        self.title.set_text(&name);
-        let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+    fn update_titles(&self) {
+        let name = self.display_name();
+        let dirty = if self.view.is_dirty() { "• " } else { "" };
+        self.title.set_text(&format!("{dirty}{name}"));
+        let path = self.path.borrow();
+        let dir = path.as_ref().and_then(|p| p.parent()).map(|d| d.display().to_string()).unwrap_or_default();
         let dir = match std::env::var("HOME") {
             Ok(home) if dir.starts_with(&home) => format!("~{}", &dir[home.len()..]),
             _ => dir,
         };
         self.subtitle.set_text(&dir);
         self.subtitle.set_visible(!dir.is_empty());
-        self.win.set_title(Some(&format!("{name} — Folio")));
+        self.win.set_title(Some(&format!("{dirty}{name} — Folio")));
     }
 
     fn watch(self: &Rc<Self>, path: &Path) {
@@ -529,7 +697,7 @@ impl Win {
                 let id = glib::timeout_add_local_once(Duration::from_millis(60), move || {
                     if let Some(w) = weak.upgrade() {
                         w.reload_timer.take();
-                        w.reload();
+                        w.on_disk_change();
                     }
                 });
                 *w.reload_timer.borrow_mut() = Some(id);

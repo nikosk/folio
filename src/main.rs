@@ -1,5 +1,6 @@
 mod app;
 mod doc;
+mod editor;
 mod headless;
 mod highlight;
 mod layout;

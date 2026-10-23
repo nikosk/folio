@@ -5,7 +5,7 @@
 //! refines. Cached layouts far from the viewport are dropped, so memory and
 //! open time stay flat regardless of document size.
 
-use crate::doc::{st, Align, Alert, Block, Cont, Doc, Kind, Marker, Rich};
+use crate::doc::{st, Align, Alert, Block, Cont, Doc, Kind, Marker, Rich, SrcStyle};
 use crate::highlight::{self, Tok};
 use crate::paint::Painter;
 use crate::theme::{Theme, BODY_FONT, MATH_FONT, MONO_FONT};
@@ -226,10 +226,17 @@ pub struct Engine {
     pub sel: Option<(Pos, Pos)>,
     pub matches: Vec<(Pos, usize)>,
     pub cur_match: Option<usize>,
+    /// The Markdown source; blocks' `src` ranges index into it.
+    pub src: String,
+    pub caret: Option<Pos>,
+    pub caret_on: bool,
+    /// Uncommitted input-method text, drawn at the caret.
+    pub preedit: String,
+    pub ed: crate::editor::EditState,
 }
 
 impl Engine {
-    pub fn new(ctx: pango::Context, doc: Doc, base_dir: PathBuf, theme: Theme, zoom: f64) -> Engine {
+    pub fn new(ctx: pango::Context, src: String, doc: Doc, base_dir: PathBuf, theme: Theme, zoom: f64) -> Engine {
         let n = doc.blocks.len();
         let mut e = Engine {
             doc,
@@ -253,6 +260,11 @@ impl Engine {
             sel: None,
             matches: Vec::new(),
             cur_match: None,
+            src,
+            caret: None,
+            caret_on: true,
+            preedit: String::new(),
+            ed: Default::default(),
         };
         e.compute_gaps();
         for i in 0..n {
@@ -325,6 +337,11 @@ impl Engine {
             Kind::Rule => 0.6 * em,
             Kind::Table { rows, .. } => rows.len() as f64 * 2.55 * em,
             Kind::Image { .. } => 14.0 * em,
+            Kind::Source { rich, style } => match style {
+                SrcStyle::Heading(l) => heading_scale(*l) * em * 1.3,
+                SrcStyle::Text => lines(rich.text.len(), 0.5 * em) * 1.65 * em,
+                _ => rich.text.lines().count().max(1) as f64 * 1.55 * 0.875 * em + 1.9 * em,
+            },
         }
     }
 
@@ -412,7 +429,7 @@ impl Engine {
 
     /// Drop cached layouts; with `remeasure`, heights become estimates again
     /// (the previous values are kept as the estimate).
-    fn invalidate(&mut self, remeasure: bool) {
+    pub fn invalidate(&mut self, remeasure: bool) {
         for c in &mut self.cache {
             *c = None;
         }
@@ -425,7 +442,63 @@ impl Engine {
         }
     }
 
-    fn invalidate_block(&mut self, i: usize) {
+    /// Replace blocks `r` with `blocks`, keeping per-block state of the rest.
+    pub fn splice(&mut self, r: std::ops::Range<usize>, blocks: Vec<Block>) {
+        let n = blocks.len();
+        self.doc.blocks.splice(r.clone(), blocks);
+        self.splice_state(r, n);
+    }
+
+    /// Like `splice`, but a new block that `same` finds equal to one of the
+    /// replaced blocks keeps that block's layout and measured height.
+    pub fn splice_reuse(&mut self, r: std::ops::Range<usize>, blocks: Vec<Block>, same: impl Fn(&Block, &Block) -> bool) {
+        let (a, n) = (r.start, blocks.len());
+        let old: Vec<Block> = self.doc.blocks.splice(r.clone(), blocks).collect();
+        let mut kept: Vec<(Option<Laid>, f64, bool)> = r.clone().map(|i| (self.cache[i].take(), self.h[i], self.measured[i])).collect();
+        self.n_cached -= kept.iter().filter(|k| k.0.is_some()).count();
+        self.splice_state(r, n);
+        let mut k = 0;
+        for j in 0..n {
+            let Some(m) = (k..old.len().min(k + 4)).find(|&m| same(&old[m], &self.doc.blocks[a + j])) else { continue };
+            let (laid, h, measured) = std::mem::take(&mut kept[m]);
+            if laid.is_some() {
+                self.n_cached += 1;
+            }
+            self.cache[a + j] = laid;
+            self.h[a + j] = h;
+            if measured {
+                self.measured[a + j] = true;
+                self.unmeasured -= 1;
+            }
+            k = m + 1;
+        }
+    }
+
+    /// Update per-block state after `doc.blocks[r]` was replaced by `n` blocks.
+    pub fn splice_state(&mut self, r: std::ops::Range<usize>, n: usize) {
+        let a = r.start;
+        let removed = r.clone().filter(|&i| !self.measured[i]).count();
+        self.n_cached -= self.cache[r.clone()].iter().filter(|c| c.is_some()).count();
+        self.cache.splice(r.clone(), (0..n).map(|_| None));
+        self.measured.splice(r.clone(), (0..n).map(|_| false));
+        self.unmeasured = self.unmeasured - removed + n;
+        self.h.splice(r.clone(), (0..n).map(|_| 0.0));
+        self.gap.splice(r.clone(), (0..n).map(|_| 0.0));
+        self.ys.resize(self.len() + 1, 0.0);
+        let em = self.em();
+        for i in a..(a + n + 1).min(self.len()) {
+            self.gap[i] = gap_between(&self.doc, i, em);
+        }
+        for i in a..a + n {
+            self.h[i] = self.estimate(i);
+        }
+        self.bg_next = self.bg_next.min(a);
+        self.ys_dirty = true;
+        self.matches.clear();
+        self.cur_match = None;
+    }
+
+    pub fn invalidate_block(&mut self, i: usize) {
         if self.cache[i].take().is_some() {
             self.n_cached -= 1;
         }
@@ -568,8 +641,10 @@ impl Engine {
         }
 
         match &b.kind {
-            Kind::Code { .. } | Kind::FrontMatter(_) => p.rrect(x, oy, w, laid.h, 6.0, &th.code_bg),
-            Kind::Heading { level, .. } if *level <= 2 => p.rect(x, oy + laid.h - 1.0, w, 1.0, &th.border),
+            Kind::Code { .. } | Kind::FrontMatter(_) | Kind::Source { style: SrcStyle::Code { .. }, .. } => {
+                p.rrect(x, oy, w, laid.h, 6.0, &th.code_bg)
+            }
+            _ if heading_level(&b.kind).is_some_and(|l| l <= 2) => p.rect(x, oy + laid.h - 1.0, w, 1.0, &th.border),
             Kind::Rule => p.rect(x, oy + (laid.h / 2.0).round() - 1.0, w, 2.0, &th.border),
             Kind::Table { .. } => {
                 if let Some((cols, rows)) = &laid.table {
@@ -636,6 +711,25 @@ impl Engine {
                 }
             }
             p.layout(&part.l, px0, py0, &part.color);
+            if let Some(c) = self.caret.filter(|c| c.block == i && c.part == pi) {
+                let (pos, _) = part.l.cursor_pos(part.layout_idx(c.idx, true) as i32);
+                let (cx, cy, ch) = (px0 + px(pos.x()), py0 + px(pos.y()), px(pos.height()));
+                if !self.preedit.is_empty() {
+                    let l = pango::Layout::new(&self.ctx);
+                    l.set_font_description(Some(&font(BODY_FONT, em)));
+                    l.set_text(&self.preedit);
+                    let attrs = pango::AttrList::new();
+                    attr(&attrs, pango::AttrInt::new_underline(pango::Underline::Single), 0, u32::MAX);
+                    l.set_attributes(Some(&attrs));
+                    let (pw, ph) = l.pixel_size();
+                    let py = cy + (ch - ph as f64).max(0.0);
+                    p.rect(cx, py, pw as f64, ph as f64, &th.bg);
+                    p.layout(&l, cx, py, &th.fg);
+                    p.rect(cx + pw as f64, cy, 1.5, ch, &th.caret);
+                } else if self.caret_on {
+                    p.rect(cx.round() - 0.5, cy, 1.5, ch, &th.caret);
+                }
+            }
         }
 
         for d in &laid.deco {
@@ -811,6 +905,67 @@ impl Engine {
         }
     }
 
+    /// Caret rectangle of a position: (x in widget coords, document y, height).
+    pub fn caret_rect(&mut self, p: Pos) -> Option<(f64, f64, f64)> {
+        if p.block >= self.len() {
+            return None;
+        }
+        self.ensure_block(p.block);
+        self.update_ys();
+        let (bx, by) = (self.block_x(p.block), self.ys[p.block] + self.gap[p.block]);
+        let laid = self.cache[p.block].as_ref()?;
+        let Some(part) = laid.parts.get(p.part) else {
+            return Some((bx, by, laid.h.max(self.em())));
+        };
+        let (c, _) = part.l.cursor_pos(part.layout_idx(p.idx, true) as i32);
+        Some((bx + part.x + px(c.x()), by + part.y + px(c.y()), px(c.height())))
+    }
+
+    /// The position one visual line above or below `p`, nearest to `goal_x`.
+    pub fn vmove(&mut self, p: Pos, down: bool, goal_x: f64) -> Option<Pos> {
+        let (_, mut y, mut h) = self.caret_rect(p)?;
+        let top = self.ys[p.block] + self.gap[p.block];
+        if let Some(part) = self.cache[p.block].as_ref().and_then(|l| l.parts.get(p.part)) {
+            // Use the whole line box: it is taller than the caret.
+            let (line, _) = part.l.index_to_line_x(part.layout_idx(p.idx, true) as i32, false);
+            let mut it = part.l.iter();
+            for _ in 0..line {
+                it.next_line();
+            }
+            let (y0, y1) = it.line_yrange();
+            (y, h) = (top + part.y + px(y0), px(y1 - y0));
+        }
+        let ty = if down { y + h + 1.0 } else if y - 1.0 < top { self.ys[p.block] - 0.5 } else { y - 1.0 };
+        if ty < 0.0 || (!down && p.block == 0 && y - 1.0 < top) {
+            return Some(Pos { idx: 0, ..p });
+        }
+        self.update_ys();
+        if down && ty >= self.ys[self.len()] {
+            return Some(self.line_edge(p, true));
+        }
+        self.hit(goal_x, ty).map(|h| h.0)
+    }
+
+    /// Start or end of the visual line containing `p`.
+    pub fn line_edge(&mut self, p: Pos, end: bool) -> Pos {
+        if p.block >= self.len() {
+            return p;
+        }
+        self.ensure_block(p.block);
+        let Some(part) = self.cache[p.block].as_ref().and_then(|l| l.parts.get(p.part)) else { return p };
+        let (line, _) = part.l.index_to_line_x(part.layout_idx(p.idx, true) as i32, false);
+        let Some(l) = part.l.line_readonly(line) else { return p };
+        let ls = l.start_index() as usize;
+        let mut le = ls + l.length() as usize;
+        let text = part.l.text();
+        let last = line + 1 >= part.l.line_count();
+        if !last && text[..le].ends_with(' ') {
+            le -= 1;
+        }
+        let li = if end { le } else { ls };
+        Pos { idx: part.text_idx(li).min(self.doc.blocks[p.block].part_text(p.part).len()), ..p }
+    }
+
     pub fn anchor_y(&mut self, anchor: &str) -> Option<f64> {
         let i = if let Some(n) = anchor.strip_prefix("fn:") {
             let n: u32 = n.parse().ok()?;
@@ -940,19 +1095,27 @@ fn gap_between(doc: &Doc, i: usize, em: f64) -> f64 {
         _ => None,
     });
     if let Some(id) = common
-        && doc.is_tight(id) && !matches!(c.kind, Kind::Heading { .. }) {
-            let both_text = matches!(c.kind, Kind::Para(_)) && matches!(p.kind, Kind::Para(_));
+        && doc.is_tight(id) && heading_level(&c.kind).is_none() {
+            let both_text = is_text(&c.kind) && is_text(&p.kind);
             return if both_text { 0.3 * em } else { 0.55 * em };
         }
-    let top: f64 = match c.kind {
-        Kind::Heading { level, .. } => [1.7, 1.5, 1.35, 1.2, 1.1, 1.1][(level.clamp(1, 6) - 1) as usize],
-        _ => 0.9,
+    let top: f64 = match heading_level(&c.kind) {
+        Some(level) => [1.7, 1.5, 1.35, 1.2, 1.1, 1.1][(level.clamp(1, 6) - 1) as usize],
+        None => 0.9,
     };
-    let bottom = match p.kind {
-        Kind::Heading { .. } => 0.55,
-        _ => 0.9,
-    };
+    let bottom = if heading_level(&p.kind).is_some() { 0.55 } else { 0.9 };
     top.max(bottom) * em
+}
+
+fn heading_level(k: &Kind) -> Option<u8> {
+    match k {
+        Kind::Heading { level, .. } | Kind::Source { style: SrcStyle::Heading(level), .. } => Some(*level),
+        _ => None,
+    }
+}
+
+fn is_text(k: &Kind) -> bool {
+    matches!(k, Kind::Para(_) | Kind::Source { style: SrcStyle::Text, .. })
 }
 
 /// Layout context for building one block.
@@ -1046,6 +1209,9 @@ impl Lx<'_> {
                 && let Some(a) = alert {
                     attr(&attrs, fg(&th.alert(a)), s, e);
                 }
+            if y & st::SYNTAX != 0 {
+                attr(&attrs, fg(&th.syntax_mark), s, e);
+            }
         }
         l.set_attributes(Some(&attrs));
         (l, ins)
@@ -1118,6 +1284,45 @@ impl Lx<'_> {
                 l.0.set_alignment(pango::Alignment::Center);
                 part(l, 0.0, 0.3 * em, w, th.fg) + 0.6 * em
             }
+            Kind::Source { rich, style } => match style {
+                SrcStyle::Text => {
+                    let l = self.rich(rich, &body, w, line_h, alert_of(b));
+                    l.0.set_alignment(align);
+                    let quoted = b.conts.iter().any(|c| matches!(c, Cont::Quote { alert: None, .. }));
+                    part(l, 0.0, 0.0, w, if quoted { th.muted } else { th.fg })
+                }
+                SrcStyle::Heading(level) => {
+                    let size = heading_scale(*level) * em;
+                    let mut desc = font(BODY_FONT, size);
+                    desc.set_weight(if *level == 1 { pango::Weight::Bold } else { pango::Weight::Semibold });
+                    let l = self.rich(rich, &desc, w, size * 1.3, None);
+                    let h = part(l, 0.0, 0.0, w, if *level == 6 { th.muted } else { th.heading });
+                    if *level <= 2 { h + 0.45 * em } else { h }
+                }
+                SrcStyle::Mono => {
+                    let size = 0.875 * em;
+                    let l = self.rich(rich, &font(MONO_FONT, size), w, size * 1.55, None);
+                    part(l, 0.0, 0.0, w, th.fg)
+                }
+                SrcStyle::Code { lang, body: code } => {
+                    let size = 0.875 * em;
+                    let (padx, pady) = (1.0 * em, 0.85 * em);
+                    let text = &rich.text;
+                    let l = self.layout(text, &font(MONO_FONT, size), w - 2.0 * padx, size * 1.55);
+                    let attrs = l.attributes().unwrap_or_default();
+                    attr(&attrs, fg(&th.syntax_mark), 0, code.start as u32);
+                    attr(&attrs, fg(&th.syntax_mark), code.end as u32, u32::MAX);
+                    let o = code.start as u32;
+                    for (s, e, tok) in highlight::highlight(lang, &text[code.clone()]) {
+                        attr(&attrs, fg(&th.syntax(tok)), s + o, e + o);
+                        if tok == Tok::Com {
+                            attr(&attrs, pango::AttrInt::new_style(pango::Style::Italic), s + o, e + o);
+                        }
+                    }
+                    l.set_attributes(Some(&attrs));
+                    part((l, Vec::new()), padx, pady, w - 2.0 * padx, th.fg) + 2.0 * pady
+                }
+            },
             Kind::Rule => 0.6 * em,
             Kind::Table { aligns, rows } => {
                 let cols = aligns.len();
@@ -1266,7 +1471,7 @@ mod tests {
     fn copy_selection_as_text() {
         let doc = crate::doc::parse("# Title\n\nSome `code` here.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
         let ctx = pangocairo::FontMap::new().create_context();
-        let mut e = Engine::new(ctx, doc, PathBuf::new(), Theme::light(), 1.0);
+        let mut e = Engine::new(ctx, String::new(), doc, PathBuf::new(), Theme::light(), 1.0);
         e.set_width(800.0);
         e.select_all();
         assert_eq!(e.selected_text(), "Title\nSome code here.\na\tb\n1\t2");
@@ -1279,7 +1484,7 @@ mod tests {
     fn hit_maps_back_through_padding() {
         let doc = crate::doc::parse("ab `cd` ef");
         let ctx = pangocairo::FontMap::new().create_context();
-        let mut e = Engine::new(ctx, doc, PathBuf::new(), Theme::light(), 1.0);
+        let mut e = Engine::new(ctx, String::new(), doc, PathBuf::new(), Theme::light(), 1.0);
         e.set_width(800.0);
         e.ensure(0.0, 500.0);
         // Walk across the line: text offsets must be monotonic and never

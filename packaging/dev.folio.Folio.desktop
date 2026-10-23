@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=Folio
-GenericName=Markdown Viewer
-Comment=Fast, beautiful Markdown viewer
+GenericName=Markdown Editor
+Comment=Fast, beautiful Markdown editor
 Exec=folio %F
 Icon=text-x-generic
 Terminal=false
-Categories=Office;Viewer;TextTools;
+Categories=Utility;TextEditor;TextTools;
 MimeType=text/markdown;text/x-markdown;
 StartupNotify=true
 StartupWMClass=dev.folio.Folio

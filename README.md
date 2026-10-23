@@ -1,8 +1,8 @@
 # Folio
 
-A fast, good-looking Markdown viewer for Linux, in the spirit of Typora.
-Native GTK 4 and Rust, no web engine. v1 opens and displays files; v2 will
-add Typora-style inline editing on the same engine.
+A fast, good-looking Markdown editor for Linux, in the spirit of Typora.
+Native GTK 4 and Rust, no web engine. The document is always rendered; the
+block you are editing shows its Markdown source, with the syntax dimmed.
 
 ## Install a release
 
@@ -22,7 +22,17 @@ cargo build --release
 ./install.sh                                    # optional: ~/.local/bin + desktop entry
 ```
 
-## Features (v1)
+## Features
+
+- Typora-style editing: click anywhere to place the caret. The block under
+  the caret shows its Markdown (syntax dimmed, styles kept); every other
+  block stays rendered. `Esc` goes back to reading.
+- Enter continues lists (bullets, numbers, task boxes) and quotes; Enter on
+  an empty item ends the list. Backspace at the start of an item removes its
+  marker, at the start of a paragraph joins it to the one above.
+- Input goes through the GTK input method, so IME, compose and dead keys work.
+- Undo/redo by word, cut/copy/paste (as Markdown), save/save as, a dirty
+  marker in the title, and a prompt before closing unsaved work.
 
 - CommonMark + GitHub Flavored Markdown: tables (with alignment), task lists,
   strikethrough, footnotes, autolinks, GitHub alerts (`> [!NOTE]` …),
@@ -36,20 +46,30 @@ cargo build --release
 - Light and dark themes, following the GNOME colour-scheme setting live.
 - Text selection (drag, double-click word, triple-click block), copy,
   primary selection, find with match highlighting.
-- Live reload when the file changes on disk, keeping the scroll position.
-- Relative links to other Markdown files open in place; `Alt+←` goes back.
+- Live reload when another program changes the file (your own saves are
+  recognised; with unsaved edits you are asked first).
+- Relative links to other Markdown files open in place (`Ctrl`+click while
+  editing); `Alt+←` goes back.
 
 ## Keys
 
 | Action | Keys |
 |---|---|
-| Open | `Ctrl+O` (or drop a file on the window) |
+| New / open | `Ctrl+N` / `Ctrl+O` (or drop a file on the window) |
+| Save / save as | `Ctrl+S` / `Ctrl+Shift+S` |
+| Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` |
+| Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` |
+| Bold / italic | `Ctrl+B` / `Ctrl+I` (wraps the selection) |
+| Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
+| Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |
+| Line break inside a block | `Shift+Enter` |
+| Stop editing (reading mode) | `Esc` |
 | Find / next / previous | `Ctrl+F` / `Enter`, `Ctrl+G` / `Shift+Enter`, `Ctrl+Shift+G` |
 | Zoom in / out / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, or `Ctrl`+scroll |
 | Toggle dark mode | `Ctrl+D` |
 | Reload | `Ctrl+R`, `F5` |
 | Back (after following a link) | `Alt+←` |
-| Scroll | arrows, `j`/`k`, `Space`/`Shift+Space`, `PgUp`/`PgDn`, `Home`/`End`, `g`/`G` |
+| Scroll (reading mode) | arrows, `j`/`k`, `Space`/`Shift+Space`, `PgUp`/`PgDn`, `Home`/`End`, `g`/`G` |
 | Select all / copy | `Ctrl+A` / `Ctrl+C` |
 | Close window / quit | `Ctrl+W` / `Ctrl+Q` |
 
@@ -63,6 +83,11 @@ cargo build --release
   and memory don't grow with file size.
 - **Parallel startup.** The file is read and parsed on a worker thread while
   GTK initialises.
+- **Incremental editing.** A keystroke changes the text, re-parses only the
+  top-level blocks around it (out to the nearest blank lines) and re-shapes
+  one paragraph; unchanged neighbours keep their layout. Edits that can
+  affect the whole document (code fences that lose their end, footnotes,
+  link definitions) fall back to a full re-parse, which is still ~5 ms.
 - **Single instance.** A second `folio file.md` hands the file to the running
   process over D-Bus and opens a new window there.
 
@@ -75,6 +100,8 @@ pessimistic), 750 KB / 2,700-block file:
 | Lay out one screen (fonts warm) | ~3 ms |
 | Scroll step (new blocks entering view) | 0.9 ms median, 2.5 ms max |
 | Find across the whole document | 1.8 ms |
+| Keystroke: edit + re-parse + layout (typing into a paragraph) | 0.42 ms median, 1.7 ms max |
+| Keystroke: Enter / undo | 0.07 ms / 0.06 ms median |
 | Cold start → first frame, Cairo renderer | ~135–150 ms, 59 MB RSS |
 | Cold start → first frame, GL renderer | ~300–400 ms (dominated by GL init) |
 
@@ -90,30 +117,28 @@ but draws every frame on the CPU. Try it with `GSK_RENDERER=cairo folio FILE`.
 
 ```sh
 cargo test
-folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--select-all] FILE
-folio --bench FILE                     # engine timings, no display needed
+folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--select-all] [--caret OFFSET] FILE
+folio --bench FILE                     # engine and typing timings, no display needed
 python3 samples/gen_big.py             # generate samples/big.md for benchmarking
 FOLIO_STARTUP=1 folio FILE             # print startup phase timings, exit after first frame
 FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND)
 scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE   # no display needed
+scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(300, 400)" "type('hi')"   # scripted input
 ```
 
 | File | Role |
 |---|---|
 | `src/doc.rs` | Markdown (pulldown-cmark) → flat list of blocks with container stacks and source ranges |
+| `src/editor.rs` | Editing: caret and selection as source offsets, the source view of the active block, incremental re-parse, undo |
 | `src/layout.rs` | Layout engine: lazy per-block Pango layout, virtual heights, painting, hit-testing, selection, find |
 | `src/view.rs` | GTK widget (`GtkScrollable`): scrolling, input, async image loading |
 | `src/app.rs` | Windows, actions, file loading, live reload, theme |
 | `src/paint.rs` | Drawing backends: GTK snapshot (GPU) and Cairo (headless) |
 | `src/highlight.rs`, `src/tex.rs` | Code highlighting, TeX → Unicode |
 
-## Roadmap: v2 editing
+## Not yet
 
-Every block already carries its source byte range, and the engine re-lays out
-individual blocks cheaply. Editing will go like this:
-
-- The block under the cursor shows its Markdown source with syntax dimmed, as
-  in Typora. All other blocks stay rendered.
-- Each keystroke edits a rope, re-parses only the affected blocks and
-  re-shapes one paragraph, so the cost per keystroke stays well under a frame.
-- Input goes through `GtkIMContext`, so IME and compose keys work.
+- Images disappear while their block is shown as source; tables are edited
+  as raw Markdown rather than cell by cell.
+- `Tab` inserts four spaces; there is no list indent/outdent yet.
+- Copy puts Markdown on the clipboard, not rich text.

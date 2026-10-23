@@ -26,6 +26,9 @@ pub struct Theme {
     pub stripe: RGBA,
     pub accent: RGBA,
     pub on_accent: RGBA,
+    pub caret: RGBA,
+    /// Markdown syntax in the source view.
+    pub syntax_mark: RGBA,
     syn: [RGBA; 9],
     alerts: [RGBA; 5],
 }
@@ -59,6 +62,8 @@ impl Theme {
             stripe: c(0xfafbfc, 1.0),
             accent: c(0x0b69d6, 1.0),
             on_accent: c(0xffffff, 1.0),
+            caret: c(0x0b69d6, 1.0),
+            syntax_mark: c(0x9aa3ad, 1.0),
             syn: [
                 c(0xcf222e, 1.0),
                 c(0x0a3069, 1.0),
@@ -93,6 +98,8 @@ impl Theme {
             stripe: c(0x202226, 1.0),
             accent: c(0x5aa2f5, 1.0),
             on_accent: c(0x101214, 1.0),
+            caret: c(0x6cb0ff, 1.0),
+            syntax_mark: c(0x6b727c, 1.0),
             syn: [
                 c(0xff7b72, 1.0),
                 c(0xa5d6ff, 1.0),

@@ -23,6 +23,8 @@ pub mod st {
     pub const KBD: u16 = 1 << 8;
     pub const BADGE: u16 = 1 << 9;
     pub const ALERT: u16 = 1 << 10;
+    /// Markdown syntax shown dimmed in the source view of the active block.
+    pub const SYNTAX: u16 = 1 << 11;
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -67,7 +69,8 @@ impl Rich {
         self.text.trim().is_empty()
     }
 
-    fn trim(&mut self) {
+    /// Trim surrounding whitespace; returns the number of leading bytes cut.
+    fn trim(&mut self) -> usize {
         let end = self.text.trim_end().len();
         self.text.truncate(end);
         let start = self.text.len() - self.text.trim_start().len();
@@ -80,6 +83,7 @@ impl Rich {
             sp.end = sp.end.clamp(s, e) - s;
             sp.start < sp.end
         });
+        start
     }
 
     pub fn span_at(&self, idx: usize, style: u16) -> Option<&Span> {
@@ -142,6 +146,17 @@ pub enum Kind {
     /// Row 0 is the header row; all rows have `aligns.len()` cells.
     Table { aligns: Vec<Align>, rows: Vec<Vec<Rich>> },
     Image { url: String, alt: String, width: Option<f64> },
+    /// The block under the caret, shown as its Markdown source.
+    Source { rich: Rich, style: SrcStyle },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SrcStyle {
+    Text,
+    Heading(u8),
+    /// Monospace on a code background; `body` is the code inside the fences.
+    Code { lang: String, body: Range<usize> },
+    Mono,
 }
 
 #[derive(Debug)]
@@ -151,6 +166,10 @@ pub struct Block {
     pub marker: Option<Marker>,
     pub center: bool,
     pub src: Range<usize>,
+    /// Source map, sorted: `[part, text offset, source offset]` at the start
+    /// of each run of text that was copied from the source. Source offsets
+    /// are relative to `src.start`, so moving a block only moves `src`.
+    pub map: Vec<[u32; 3]>,
 }
 
 impl Block {
@@ -165,7 +184,7 @@ impl Block {
 
     pub fn part_text(&self, part: usize) -> &str {
         match &self.kind {
-            Kind::Para(r) | Kind::Heading { text: r, .. } | Kind::Math(r) => &r.text,
+            Kind::Para(r) | Kind::Heading { text: r, .. } | Kind::Math(r) | Kind::Source { rich: r, .. } => &r.text,
             Kind::Code { text, .. } | Kind::FrontMatter(text) => text,
             Kind::Table { rows, aligns } => &rows[part / aligns.len()][part % aligns.len()].text,
             Kind::Rule | Kind::Image { .. } => "",
@@ -174,10 +193,49 @@ impl Block {
 
     pub fn part_rich(&self, part: usize) -> Option<&Rich> {
         match &self.kind {
-            Kind::Para(r) | Kind::Heading { text: r, .. } | Kind::Math(r) => Some(r),
+            Kind::Para(r) | Kind::Heading { text: r, .. } | Kind::Math(r) | Kind::Source { rich: r, .. } => Some(r),
             Kind::Table { rows, aligns } => Some(&rows[part / aligns.len()][part % aligns.len()]),
             _ => None,
         }
+    }
+
+    /// Map a text position in a part to a source byte offset.
+    pub fn text_to_src(&self, part: usize, idx: usize) -> usize {
+        let p = part as u32;
+        let s0 = self.src.start;
+        let k = self.map.partition_point(|m| m[0] < p || (m[0] == p && m[1] as usize <= idx));
+        match k.checked_sub(1).map(|k| (k, self.map[k])) {
+            Some((k, m)) if m[0] == p => {
+                // Clamp to this run so positions in hidden syntax stay inside it.
+                let next = self.map.get(k + 1).filter(|n| n[0] == p).map_or(self.src.end, |n| s0 + n[2] as usize);
+                let at = s0 + m[2] as usize;
+                (at + (idx - m[1] as usize)).min(next.max(at)).min(self.src.end)
+            }
+            _ if idx == 0 => self.map.iter().find(|m| m[0] == p).map_or(s0, |m| s0 + m[2] as usize),
+            _ => self.src.end,
+        }
+    }
+
+    /// Map a source byte offset inside this block to (part, text position).
+    pub fn src_to_text(&self, off: usize) -> (usize, usize) {
+        let o = off.saturating_sub(self.src.start) as u32;
+        let Some(k) = self.map.iter().rposition(|m| m[2] <= o) else {
+            return match self.map.first() {
+                Some(m) => (m[0] as usize, m[1] as usize),
+                None => (0, if off > self.src.start { 1 } else { 0 }),
+            };
+        };
+        let m = self.map[k];
+        let part = m[0] as usize;
+        let len = self.part_text(part).len();
+        let next = self.map.get(k + 1).filter(|n| n[0] == m[0]).map_or(len, |n| n[1] as usize);
+        let mut idx = (m[1] + (o - m[2])) as usize;
+        idx = idx.min(next).min(len);
+        let t = self.part_text(part);
+        while !t.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        (part, idx)
     }
 }
 
@@ -187,29 +245,200 @@ pub struct Doc {
     pub links: Vec<String>,
     /// Indexed by list container id: true if the list is loose.
     pub loose: Vec<bool>,
+    /// Footnotes or link reference definitions make parsing depend on the
+    /// whole document, so edits must re-parse all of it.
+    pub global: bool,
 }
 
 impl Doc {
     pub fn is_tight(&self, list_id: u32) -> bool {
         !self.loose.get(list_id as usize).copied().unwrap_or(false)
     }
+
+    /// Give headings unique anchors in document order (after splicing).
+    pub fn reslug(&mut self) {
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        for b in &mut self.blocks {
+            if let Kind::Heading { text, slug, .. } = &mut b.kind {
+                *slug = unique_slug(&mut seen, &text.text);
+            }
+        }
+    }
 }
 
-pub fn parse(src: &str) -> Doc {
-    let opts = Options::ENABLE_TABLES
+fn opts() -> Options {
+    Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_HEADING_ATTRIBUTES
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
         | Options::ENABLE_MATH
-        | Options::ENABLE_GFM;
-    let mut b = Builder::default();
-    for (ev, r) in Parser::new_ext(src, opts).into_offset_iter() {
+        | Options::ENABLE_GFM
+}
+
+/// Front matter (`---` YAML or `+++` TOML) at the very start of the file:
+/// (end of the block, range of its content). pulldown-cmark would also
+/// accept such a block mid-document, swallowing text between two rules.
+fn front_matter(src: &str) -> Option<(usize, Range<usize>)> {
+    let delim = ["---", "+++"].into_iter().find(|d| src.starts_with(d))?;
+    let first = src.find('\n')? + 1;
+    if !src[3..first].trim().is_empty() || src[first..].lines().next().is_none_or(|l| l.trim().is_empty()) {
+        return None;
+    }
+    let mut at = first;
+    for line in src[first..].split_inclusive('\n') {
+        let l = line.trim_end();
+        if l == delim || (delim == "---" && l == "...") {
+            return Some((at + l.len(), first..at));
+        }
+        at += line.len();
+    }
+    None
+}
+
+pub fn parse(src: &str) -> Doc {
+    let Some((end, body)) = front_matter(src) else { return parse_body(src) };
+    let mut d = parse_region(src, end..src.len(), &Doc::default());
+    let text = src[body.clone()].trim_end_matches('\n').to_string();
+    let block = Block {
+        kind: Kind::FrontMatter(text),
+        conts: Vec::new(),
+        marker: None,
+        center: false,
+        src: 0..end,
+        map: vec![[0, 0, body.start as u32]],
+    };
+    d.blocks.insert(0, block);
+    d
+}
+
+fn parse_body(src: &str) -> Doc {
+    let mut b = Builder { src, ..Default::default() };
+    let mut it = Parser::new_ext(src, opts()).into_offset_iter();
+    for (ev, r) in it.by_ref() {
         b.event(ev, r);
     }
-    b.finish()
+    let refs = it.reference_definitions().iter().next().is_some();
+    let mut d = b.finish();
+    d.global |= refs;
+    d
+}
+
+/// Parse `src[range]` on its own, with block ranges in `src` coordinates and
+/// container/link ids starting after `base`'s.
+pub fn parse_region(src: &str, range: std::ops::Range<usize>, base: &Doc) -> Doc {
+    let mut d = if range.start == 0 { parse(&src[range.clone()]) } else { parse_body(&src[range.clone()]) };
+    let (lo, li) = (base.loose.len() as u32, base.links.len() as u32);
+    let off = range.start;
+    for b in &mut d.blocks {
+        b.src = b.src.start + off..b.src.end + off;
+        for c in &mut b.conts {
+            match c {
+                Cont::Quote { id, .. } | Cont::List { id } => *id += lo,
+                Cont::Footnote => {}
+            }
+        }
+        let shift = |r: &mut Rich| {
+            for sp in r.spans.iter_mut().filter(|s| s.style & st::LINK != 0) {
+                sp.link += li;
+            }
+        };
+        match &mut b.kind {
+            Kind::Para(r) | Kind::Heading { text: r, .. } | Kind::Math(r) => shift(r),
+            Kind::Table { rows, .. } => rows.iter_mut().flatten().for_each(shift),
+            _ => {}
+        }
+    }
+    d
+}
+
+/// The source view of a block: its Markdown text with syntax dimmed and
+/// inline styles applied. `like` is the rendered kind it replaces.
+pub fn source_kind(text: &str, like: &Kind) -> Kind {
+    let mut style = match like {
+        Kind::Heading { level, .. } => SrcStyle::Heading(*level),
+        Kind::Table { .. } => SrcStyle::Mono,
+        Kind::Code { lang, .. } => SrcStyle::Code { lang: lang.clone(), body: 0..0 },
+        Kind::FrontMatter(_) => SrcStyle::Code { lang: "yaml".into(), body: 0..0 },
+        Kind::Source { style, .. } => style.clone(),
+        _ => SrcStyle::Text,
+    };
+    let mut marks = vec![st::SYNTAX; text.len()];
+    let mut set = |r: Range<usize>, v: u16| {
+        for m in &mut marks[r.start.min(text.len())..r.end.min(text.len())] {
+            *m = v;
+        }
+    };
+    let mut stack: Vec<u16> = Vec::new();
+    let mut body: Option<Range<usize>> = None;
+    let mut in_code = false;
+    for (ev, r) in Parser::new_ext(text, opts()).into_offset_iter() {
+        let cur = stack.iter().fold(0, |a, s| a | s);
+        match ev {
+            Event::Start(t) => match t {
+                Tag::Emphasis => stack.push(st::ITALIC),
+                Tag::Strong => stack.push(st::BOLD),
+                Tag::Strikethrough => stack.push(st::STRIKE),
+                Tag::Link { .. } => stack.push(st::LINK),
+                Tag::Image { .. } | Tag::Superscript | Tag::Subscript => stack.push(0),
+                Tag::CodeBlock(_) | Tag::MetadataBlock(_) => in_code = true,
+                _ => {}
+            },
+            Event::End(t) => match t {
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link
+                | TagEnd::Image
+                | TagEnd::Superscript
+                | TagEnd::Subscript => {
+                    stack.pop();
+                }
+                TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => in_code = false,
+                _ => {}
+            },
+            Event::Text(_) if in_code => {
+                body = Some(body.map_or(r.clone(), |b| b.start..r.end));
+                set(r, 0);
+            }
+            Event::Text(_) => set(r, cur),
+            Event::Code(t) => {
+                let s = text[r.clone()].find(&*t).map_or(r.start, |k| r.start + k);
+                set(s..s + t.len(), cur | st::CODE);
+            }
+            // TeX source keeps the body font so the line height stays even.
+            Event::InlineMath(t) | Event::DisplayMath(t) => {
+                let s = text[r.clone()].find(&*t).map_or(r.start, |k| r.start + k);
+                set(s..s + t.len(), cur);
+            }
+            Event::SoftBreak | Event::HardBreak => set(r, 0),
+            _ => {}
+        }
+    }
+    if let SrcStyle::Code { body: b, .. } = &mut style {
+        // Without content events (empty block), the body is between the fence lines.
+        *b = body.unwrap_or_else(|| {
+            let s = text.find('\n').map_or(text.len(), |k| k + 1);
+            let e = text.rfind('\n').map_or(s, |k| k.max(s));
+            s..e
+        });
+        set(b.clone(), 0);
+        marks.iter_mut().for_each(|m| *m &= st::SYNTAX);
+    }
+    let mut rich = Rich { text: text.to_string(), spans: Vec::new() };
+    let mut k = 0;
+    while k < marks.len() {
+        let v = marks[k];
+        let mut e = k + 1;
+        while e < marks.len() && marks[e] == v {
+            e += 1;
+        }
+        if v != 0 {
+            rich.spans.push(Span { start: k as u32, end: e as u32, style: v, link: 0 });
+        }
+        k = e;
+    }
+    Kind::Source { rich, style }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -237,7 +466,11 @@ struct ImgB {
 }
 
 #[derive(Default)]
-struct Builder {
+struct Builder<'a> {
+    src: &'a str,
+    /// Source map of the leaf being built (see `Block::map`).
+    map: Vec<[u32; 3]>,
+    part: u32,
     blocks: Vec<Block>,
     links: Vec<String>,
     loose: Vec<bool>,
@@ -260,13 +493,14 @@ struct Builder {
     slugs: HashMap<String, u32>,
 }
 
-impl Builder {
+impl Builder<'_> {
     fn event(&mut self, ev: Event, r: Range<usize>) {
         match ev {
             Event::Start(tag) => self.start(tag, r),
             Event::End(tag) => self.end(tag, r),
             Event::Text(t) => {
                 if let Some(c) = &mut self.code {
+                    self.map.push([0, c.text.len() as u32, r.start as u32]);
                     c.text.push_str(&t);
                 } else if let Some(h) = &mut self.html {
                     h.push_str(&t);
@@ -276,19 +510,23 @@ impl Builder {
                     self.text(&t, 0, r);
                 }
             }
-            Event::Code(t) => self.text(&t, st::CODE, r),
+            Event::Code(t) => {
+                let at = self.src[r.clone()].find(&*t).map_or(r.start, |k| r.start + k);
+                self.text(&t, st::CODE, at..r.end);
+            }
             Event::InlineMath(t) => {
                 for (s, extra) in tex::render(&t) {
-                    self.text(&s, st::MATH | extra, r.clone());
+                    self.text(&s, st::MATH | extra, r.start + 1..r.end);
                 }
             }
             Event::DisplayMath(t) => {
-                self.break_para();
+                self.break_para(r.end);
                 let mut rich = Rich::default();
                 for (s, extra) in tex::render(&t) {
                     rich.push(&s, st::MATH | extra, 0);
                 }
                 rich.trim();
+                self.map = vec![[0, 0, r.start as u32 + 2]];
                 self.push(Kind::Math(rich), r);
             }
             Event::Html(t) => {
@@ -300,10 +538,9 @@ impl Builder {
             Event::FootnoteReference(label) => {
                 let n = self.fn_num(&label);
                 let li = self.add_link(format!("#fn:{n}"));
-                self.ensure_inline(r.start);
-                let style = self.style | st::SUP | st::LINK;
-                self.inl.as_mut().unwrap().rich.push(&format!("[{n}]"), style, li);
-                self.last_end = r.end;
+                let link = std::mem::replace(&mut self.link, li);
+                self.text(&format!("[{n}]"), st::SUP | st::LINK, r);
+                self.link = link;
             }
             Event::SoftBreak => self.text(" ", 0, r),
             Event::HardBreak => self.text("\n", 0, r),
@@ -342,7 +579,8 @@ impl Builder {
                 if let Some(a) = alert {
                     let mut rich = Rich::default();
                     rich.push(a.title(), st::ALERT | st::BOLD, 0);
-                    self.push(Kind::Para(rich), r.start..r.start);
+                    let line = self.src[r.clone()].find('\n').map_or(r.end, |k| r.start + k);
+                    self.push(Kind::Para(rich), r.start..line);
                 }
             }
             Tag::CodeBlock(kind) => {
@@ -407,6 +645,9 @@ impl Builder {
                 }
             }
             Tag::TableCell => {
+                if let Some((aligns, rows)) = &self.table {
+                    self.part = ((rows.len().max(1) - 1) * aligns.len() + rows.last().map_or(0, Vec::len)) as u32;
+                }
                 self.inl = Some(Inline { leaf: Leaf::Cell, rich: Rich::default(), start: r.start });
             }
             Tag::Emphasis => self.push_style(st::ITALIC, 0),
@@ -456,7 +697,18 @@ impl Builder {
             TagEnd::Item => {
                 self.flush();
                 if self.marker.is_some() {
-                    self.push(Kind::Para(Rich::default()), r);
+                    // Empty item: the caret goes after the marker.
+                    let line = &self.src[r.clone()];
+                    let at = r.start + line.find('\n').unwrap_or(line.len());
+                    self.map.clear();
+                    self.blocks.push(Block {
+                        kind: Kind::Para(Rich::default()),
+                        conts: self.conts.clone(),
+                        marker: self.marker.take(),
+                        center: self.center,
+                        src: at..at,
+                        map: vec![[0, 0, 0]],
+                    });
                 }
             }
             TagEnd::FootnoteDefinition => {
@@ -475,11 +727,13 @@ impl Builder {
                     if !aligns.is_empty() && !rows.is_empty() {
                         self.push(Kind::Table { aligns, rows }, r);
                     }
+                    self.part = 0;
                 }
             }
             TagEnd::TableCell => {
                 if let Some(mut inl) = self.inl.take() {
-                    inl.rich.trim();
+                    let cut = inl.rich.trim();
+                    self.shift_map(cut, inl.rich.text.len());
                     if let Some((_, rows)) = &mut self.table
                         && let Some(row) = rows.last_mut() {
                             row.push(inl.rich);
@@ -546,17 +800,38 @@ impl Builder {
     fn text(&mut self, s: &str, extra: u16, r: Range<usize>) {
         self.ensure_inline(r.start);
         let (style, link) = (self.style | extra, self.link);
-        self.inl.as_mut().unwrap().rich.push(s, style, link);
+        let rich = &mut self.inl.as_mut().unwrap().rich;
+        if !s.is_empty() {
+            self.map.push([self.part, rich.text.len() as u32, r.start as u32]);
+        }
+        rich.push(s, style, link);
         self.last_end = r.end;
     }
 
+    /// Adjust the current part's map after its text was trimmed.
+    fn shift_map(&mut self, cut: usize, len: usize) {
+        let p = self.part;
+        for m in self.map.iter_mut().filter(|m| m[0] == p) {
+            let t = (m[1] as usize).saturating_sub(cut).min(len);
+            m[2] += (cut as u32).saturating_sub(m[1]);
+            m[1] = t as u32;
+        }
+    }
+
     fn push(&mut self, kind: Kind, src: Range<usize>) {
+        // Trailing whitespace belongs to the gap, not the block.
+        let end = src.start + self.src[src.clone()].trim_end().len();
+        let mut map = if matches!(kind, Kind::Rule | Kind::Image { .. }) { Vec::new() } else { std::mem::take(&mut self.map) };
+        for m in &mut map {
+            m[2] = m[2].saturating_sub(src.start as u32);
+        }
         self.blocks.push(Block {
             kind,
             conts: self.conts.clone(),
             marker: self.marker.take(),
             center: self.center,
-            src,
+            src: src.start..end,
+            map,
         });
     }
 
@@ -566,13 +841,17 @@ impl Builder {
         let src = inl.start..self.last_end.max(inl.start);
         match inl.leaf {
             Leaf::Para => {
-                inl.rich.trim();
+                let cut = inl.rich.trim();
+                self.shift_map(cut, inl.rich.text.len());
                 if !inl.rich.is_blank() {
                     self.push(Kind::Para(inl.rich), src);
+                } else {
+                    self.map.clear();
                 }
             }
             Leaf::Heading(level) => {
-                inl.rich.trim();
+                let cut = inl.rich.trim();
+                self.shift_map(cut, inl.rich.text.len());
                 let slug = self.slug(&inl.rich.text);
                 self.push(Kind::Heading { level, text: inl.rich, slug }, src);
             }
@@ -580,12 +859,12 @@ impl Builder {
         }
     }
 
-    /// Split the current paragraph so a block-level item can be inserted mid-text.
-    fn break_para(&mut self) {
+    /// Split the current paragraph so a block-level item can be inserted
+    /// mid-text; the rest of the paragraph starts at `next`.
+    fn break_para(&mut self, next: usize) {
         if self.inl.as_ref().is_some_and(|i| i.leaf == Leaf::Para) {
-            let start = self.inl.as_ref().unwrap().start;
             self.flush();
-            self.inl = Some(Inline { leaf: Leaf::Para, rich: Rich::default(), start });
+            self.inl = Some(Inline { leaf: Leaf::Para, rich: Rich::default(), start: next });
         }
     }
 
@@ -596,12 +875,14 @@ impl Builder {
             // No network access: show remote images as a compact chip that links to them.
             let label = if alt.trim().is_empty() { "image".to_string() } else { alt };
             let li = if self.link != 0 || self.style & st::LINK != 0 { self.link } else { self.add_link(url) };
-            self.ensure_inline(r.start);
-            let style = self.style | st::BADGE | st::LINK;
-            self.inl.as_mut().unwrap().rich.push(&label, style, li);
+            let (style, link) = (self.style, self.link);
+            self.style |= st::BADGE | st::LINK;
+            self.link = li;
+            self.text(&label, 0, r);
+            (self.style, self.link) = (style, link);
             return;
         }
-        self.break_para();
+        self.break_para(r.end);
         self.push(Kind::Image { url, alt, width }, r);
     }
 
@@ -716,6 +997,7 @@ impl Builder {
             return;
         }
         let rich = Rich::plain(&lines.join("\n"));
+        self.map = vec![[0, 0, r.start as u32]];
         match heading {
             Some(level) => {
                 let slug = self.slug(&rich.text);
@@ -726,17 +1008,7 @@ impl Builder {
     }
 
     fn slug(&mut self, text: &str) -> String {
-        let mut s = String::new();
-        for c in text.trim().chars() {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                s.extend(c.to_lowercase());
-            } else if c == ' ' {
-                s.push('-');
-            }
-        }
-        let n = self.slugs.entry(s.clone()).or_insert(0);
-        *n += 1;
-        if *n > 1 { format!("{s}-{}", *n - 1) } else { s }
+        unique_slug(&mut self.slugs, text)
     }
 
     fn finish(mut self) -> Doc {
@@ -751,8 +1023,23 @@ impl Builder {
                 self.blocks.extend(blocks);
             }
         }
-        Doc { blocks: self.blocks, links: self.links, loose: self.loose }
+        let global = !self.fn_nums.is_empty();
+        Doc { blocks: self.blocks, links: self.links, loose: self.loose, global }
     }
+}
+
+fn unique_slug(seen: &mut HashMap<String, u32>, text: &str) -> String {
+    let mut s = String::new();
+    for c in text.trim().chars() {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            s.extend(c.to_lowercase());
+        } else if c == ' ' {
+            s.push('-');
+        }
+    }
+    let n = seen.entry(s.clone()).or_insert(0);
+    *n += 1;
+    if *n > 1 { format!("{s}-{}", *n - 1) } else { s }
 }
 
 fn attr(tag: &str, name: &str) -> Option<String> {
@@ -829,5 +1116,15 @@ mod tests {
         assert_eq!(r.text, "bold and code link");
         assert_eq!(r.spans.len(), 3);
         assert_eq!(d.links[r.spans[2].link as usize], "http://x");
+    }
+
+    #[test]
+    fn front_matter_only_at_start() {
+        let d = parse("---\ntitle: x\n---\n\npara\n");
+        assert!(matches!(&d.blocks[0].kind, Kind::FrontMatter(t) if t == "title: x"));
+        assert_eq!(d.blocks[1].src, 18..22);
+        // A rule followed by text is not front matter.
+        let d = parse("para\n\n---\ntext\n\n---\n");
+        assert!(d.blocks.iter().all(|b| !matches!(b.kind, Kind::FrontMatter(_))));
     }
 }

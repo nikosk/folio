@@ -163,10 +163,11 @@ The agent's shell has no display. What works:
 
 ## Release
 
-CI (`.github/workflows/release.yml`) tests and builds every push. Pushing a
-`v*` tag publishes a GitHub Release with an x86_64 tarball. Bump
-`Cargo.toml`'s version first. The repo (`nikosk/folio`) is private. Each run
-spends ~10 minutes installing GTK, which counts against the Actions minutes.
+CI (`.github/workflows/release.yml`) runs on `v*` tags, pull requests and
+manual dispatch, not on pushes to `main`. A `v*` tag tests, builds and
+publishes a GitHub Release with an x86_64 tarball. Bump `Cargo.toml`'s
+version first. The repo (`nikosk/folio`) is private, so runs (~1 min each
+with the cache warm) count against the Actions minutes.
 
 ## Known v1 limitations
 

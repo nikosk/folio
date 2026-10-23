@@ -1,8 +1,10 @@
 name: Build & release
 
+# Releases come from version tags only; pushes to main don't run this
+# (every run spends ~1 min of Actions time). Pull requests still get tested,
+# and it can be run by hand from the Actions tab.
 on:
   push:
-    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:

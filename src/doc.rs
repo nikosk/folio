@@ -511,10 +511,12 @@ impl Builder<'_> {
                 }
             }
             Event::Code(t) => {
+                self.ensure_inline(r.start);
                 let at = self.src[r.clone()].find(&*t).map_or(r.start, |k| r.start + k);
                 self.text(&t, st::CODE, at..r.end);
             }
             Event::InlineMath(t) => {
+                self.ensure_inline(r.start);
                 for (s, extra) in tex::render(&t) {
                     self.text(&s, st::MATH | extra, r.start + 1..r.end);
                 }
@@ -649,6 +651,14 @@ impl Builder<'_> {
                     self.part = ((rows.len().max(1) - 1) * aligns.len() + rows.last().map_or(0, Vec::len)) as u32;
                 }
                 self.inl = Some(Inline { leaf: Leaf::Cell, rich: Rich::default(), start: r.start });
+            }
+            // In a tight list item no paragraph starts the text: it starts
+            // here, so the block's source includes this opening syntax.
+            Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Superscript | Tag::Subscript | Tag::Link { .. }
+                if self.inl.is_none() && self.code.is_none() && self.image.is_none() =>
+            {
+                self.ensure_inline(r.start);
+                self.start(tag, r)
             }
             Tag::Emphasis => self.push_style(st::ITALIC, 0),
             Tag::Strong => self.push_style(st::BOLD, 0),
@@ -911,6 +921,9 @@ impl Builder<'_> {
             }
             _ => return,
         };
+        if !name.starts_with('/') {
+            self.ensure_inline(r.start);
+        }
         if name.starts_with('/') {
             self.pop_style_if(style);
         } else if style == st::LINK {
@@ -1116,6 +1129,15 @@ mod tests {
         assert_eq!(r.text, "bold and code link");
         assert_eq!(r.spans.len(), 3);
         assert_eq!(d.links[r.spans[2].link as usize], "http://x");
+    }
+
+    #[test]
+    fn tight_item_source_starts_at_its_syntax() {
+        for s in ["- **bold** rest\n", "- `code` x\n", "- [link](u) x\n", "- <kbd>K</kbd> x\n", "- [ ] *it* x\n", "- $x$ y\n"] {
+            let b = &parse(s).blocks[0];
+            let at = if s.starts_with("- [ ]") { 6 } else { 2 };
+            assert_eq!(b.src, at..s.len() - 1, "{s:?}");
+        }
     }
 
     #[test]

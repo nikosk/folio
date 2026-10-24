@@ -3,7 +3,9 @@
 //! keyboard scrolling.
 
 use crate::doc::Doc;
+use crate::editor::{Heading, TableOp};
 use crate::layout::{Engine, Img};
+use crate::table::Align;
 use crate::paint::{Painter, SnapPainter};
 use crate::theme::{Theme, BODY_FONT};
 use gtk::gdk::{self, Key, ModifierType};
@@ -11,7 +13,7 @@ use gtk::glib::{self, clone};
 use gtk::subclass::prelude::*;
 use gtk::{gio, pango, prelude::*};
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 type LinkHandler = Box<dyn Fn(&str)>;
@@ -45,6 +47,12 @@ mod imp {
         pub im: gtk::IMMulticontext,
         pub blink: RefCell<Option<glib::SourceId>>,
         pub version: Cell<u64>,
+        pub on_scrolled: RefCell<Option<ChangeHandler>>,
+        /// Right-click menu for tables.
+        pub table_menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The document's folder once it has been saved; pasted images go
+        /// into `images/` under it.
+        pub doc_dir: RefCell<Option<PathBuf>>,
     }
 
     impl Default for DocView {
@@ -72,6 +80,9 @@ mod imp {
                 im: gtk::IMMulticontext::new(),
                 blink: RefCell::new(None),
                 version: Cell::new(0),
+                on_scrolled: RefCell::new(None),
+                table_menu: RefCell::new(None),
+                doc_dir: RefCell::new(None),
             }
         }
     }
@@ -118,12 +129,22 @@ mod imp {
             obj.set_overflow(gtk::Overflow::Hidden);
             obj.add_css_class("view");
             obj.setup_input();
+            obj.setup_table_menu();
+        }
+
+        fn dispose(&self) {
+            if let Some(m) = self.table_menu.take() {
+                m.unparent();
+            }
         }
     }
 
     impl WidgetImpl for DocView {
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             let obj = self.obj();
+            if let Some(m) = self.table_menu.borrow().as_ref() {
+                m.present();
+            }
             obj.relayout(|e| {
                 e.set_width(width as f64);
             });
@@ -241,6 +262,11 @@ impl DocView {
         self.notify_change();
     }
 
+    /// The saved document's folder (`None` while untitled).
+    pub fn set_doc_dir(&self, dir: Option<PathBuf>) {
+        *self.imp().doc_dir.borrow_mut() = dir;
+    }
+
     pub fn set_base_dir(&self, dir: PathBuf) {
         if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
             e.base_dir = dir;
@@ -311,6 +337,38 @@ impl DocView {
         }
         self.sync(None);
         self.queue_draw();
+        if let Some(f) = self.imp().on_scrolled.borrow().as_ref() {
+            f();
+        }
+    }
+
+    pub fn connect_scrolled<F: Fn() + 'static>(&self, f: F) {
+        *self.imp().on_scrolled.borrow_mut() = Some(Box::new(f));
+    }
+
+    // ---- outline -----------------------------------------------------------
+
+    pub fn outline(&self) -> Vec<Heading> {
+        self.imp().eng.borrow().as_ref().map(|e| e.outline()).unwrap_or_default()
+    }
+
+    /// Index into `outline()` of the section being read: the last heading
+    /// at or above the top of the view (where outline clicks put it), else
+    /// the first heading.
+    pub fn current_heading(&self) -> Option<usize> {
+        let top = self.top();
+        let mut eng = self.imp().eng.borrow_mut();
+        let e = eng.as_mut()?;
+        let em = e.em();
+        e.heading_at(top + 3.0 * em).or_else(|| e.heading_at(f64::MAX).map(|_| 0))
+    }
+
+    /// Scroll so the block at source offset `off` is near the top.
+    pub fn scroll_to_off(&self, off: usize) {
+        let y = self.imp().eng.borrow_mut().as_mut().and_then(|e| Some(e.off_y(off)? - e.em()));
+        if let Some(y) = y {
+            self.scroll_to(y);
+        }
     }
 
     /// Apply an engine change while keeping the content under the top edge fixed.
@@ -609,6 +667,8 @@ impl DocView {
         }
     }
 
+    /// Paste: files become links (images inline), text is inserted (a URL
+    /// over a selection links it), and an image is saved under `images/`.
     pub fn paste(&self) {
         if !self.editing() {
             return;
@@ -616,10 +676,84 @@ impl DocView {
         let obj = self.downgrade();
         let clip = self.clipboard();
         glib::spawn_future_local(async move {
-            if let (Ok(Some(text)), Some(obj)) = (clip.read_text_future().await, obj.upgrade()) {
-                obj.with_edit(|e| e.insert(&text));
+            let formats = clip.formats();
+            if formats.contains_type(gdk::FileList::static_type()) {
+                let v = clip.read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT).await;
+                if let (Ok(v), Some(obj)) = (v, obj.upgrade())
+                    && let Ok(list) = v.get::<gdk::FileList>()
+                {
+                    obj.insert_files(&list.files());
+                }
+                return;
+            }
+            if formats.contains_type(String::static_type()) || formats.contain_mime_type("text/plain") {
+                if let (Ok(Some(text)), Some(obj)) = (clip.read_text_future().await, obj.upgrade()) {
+                    obj.with_edit(|e| e.paste_text(&text));
+                }
+                return;
+            }
+            if let (Ok(Some(tex)), Some(obj)) = (clip.read_texture_future().await, obj.upgrade()) {
+                obj.insert_image(&tex);
             }
         });
+    }
+
+    /// Link files at the caret: images as `![name](path)`, others as
+    /// `[name](path)`, relative to the document's folder when inside it.
+    pub fn insert_files(&self, files: &[gio::File]) {
+        let dir = self.imp().doc_dir.borrow().clone();
+        let links: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.path())
+            .map(|p| {
+                let rel = dir.as_deref().and_then(|d| p.strip_prefix(d).ok()).unwrap_or(&p);
+                let target = rel.to_string_lossy();
+                let target = if target.contains([' ', '(', ')', '<', '>']) { format!("<{target}>") } else { target.into_owned() };
+                let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if is_image(&p) { format!("![{name}]({target})") } else { format!("[{name}]({target})") }
+            })
+            .collect();
+        if !links.is_empty() && self.editing() {
+            self.with_edit(|e| e.insert(&links.join("\n")));
+        }
+    }
+
+    /// Files dropped on the document: linked at the drop point.
+    pub fn drop_files(&self, files: &[gio::File], x: f64, y: f64) {
+        if !self.editing() {
+            return;
+        }
+        if let Some(off) = self.hit_off(x, y) {
+            self.with_edit(|e| e.set_caret(off, false, true));
+        }
+        self.insert_files(files);
+    }
+
+    /// Save a pasted image as `images/pasted-<time>.png` next to the document.
+    fn insert_image(&self, tex: &gdk::Texture) {
+        let Some(dir) = self.imp().doc_dir.borrow().clone() else {
+            self.alert("Save the document first", "Pasted images are saved in an “images” folder next to the document.");
+            return;
+        };
+        let images = dir.join("images");
+        let stamp = glib::DateTime::now_local().ok().and_then(|d| d.format("%Y%m%d-%H%M%S").ok()).unwrap_or_default();
+        let mut name = format!("pasted-{stamp}.png");
+        let mut n = 2;
+        while images.join(&name).exists() {
+            name = format!("pasted-{stamp}-{n}.png");
+            n += 1;
+        }
+        let path = images.join(&name);
+        if let Err(e) = std::fs::create_dir_all(&images).map_err(|e| e.to_string()).and_then(|_| tex.save_to_png(&path).map_err(|e| e.to_string())) {
+            self.alert("Could not save the pasted image", &format!("{}\n{e}", path.display()));
+            return;
+        }
+        self.with_edit(|e| e.insert(&format!("![](images/{name})")));
+    }
+
+    fn alert(&self, message: &str, detail: &str) {
+        let win = self.root().and_downcast::<gtk::Window>();
+        gtk::AlertDialog::builder().message(message).detail(detail).build().show(win.as_ref());
     }
 
     /// Wrap the selection in `mark` (e.g. `**`), or insert a pair at the caret.
@@ -638,7 +772,78 @@ impl DocView {
 
     fn insert_text(&self, text: &str) {
         if self.editing() {
-            self.with_edit(|e| e.insert(text));
+            self.with_edit(|e| e.type_text(text));
+        }
+    }
+
+    pub fn table_op(&self, op: TableOp) {
+        self.with_edit(|e| {
+            e.table_op(op);
+        });
+    }
+
+    /// Row/column/alignment actions (`table.*`) and their right-click menu.
+    fn setup_table_menu(&self) {
+        let group = gio::SimpleActionGroup::new();
+        let ops = [
+            ("row-above", TableOp::RowAbove),
+            ("row-below", TableOp::RowBelow),
+            ("col-left", TableOp::ColLeft),
+            ("col-right", TableOp::ColRight),
+            ("del-row", TableOp::DelRow),
+            ("del-col", TableOp::DelCol),
+            ("align-left", TableOp::Align(Align::Left)),
+            ("align-center", TableOp::Align(Align::Center)),
+            ("align-right", TableOp::Align(Align::Right)),
+        ];
+        for (name, op) in ops {
+            let a = gio::SimpleAction::new(name, None);
+            a.connect_activate(clone!(
+                #[weak(rename_to = obj)]
+                self,
+                move |_, _| obj.table_op(op)
+            ));
+            group.add_action(&a);
+        }
+        self.insert_action_group("table", Some(&group));
+        let menu = gio::Menu::new();
+        let section = |items: &[(&str, &str)]| {
+            let m = gio::Menu::new();
+            for (label, action) in items {
+                m.append(Some(label), Some(&format!("table.{action}")));
+            }
+            m
+        };
+        menu.append_section(None, &section(&[("Insert Row Above", "row-above"), ("Insert Row Below", "row-below")]));
+        menu.append_section(None, &section(&[("Insert Column Left", "col-left"), ("Insert Column Right", "col-right")]));
+        menu.append_section(None, &section(&[("Delete Row", "del-row"), ("Delete Column", "del-col")]));
+        menu.append_section(None, &section(&[("Align Left", "align-left"), ("Align Center", "align-center"), ("Align Right", "align-right")]));
+        let pop = gtk::PopoverMenu::from_model(Some(&menu));
+        pop.set_parent(self);
+        pop.set_has_arrow(false);
+        pop.set_halign(gtk::Align::Start);
+        *self.imp().table_menu.borrow_mut() = Some(pop);
+    }
+
+    /// Right click: put the caret there, and offer the table menu in tables.
+    fn on_context(&self, x: f64, y: f64) {
+        self.grab_focus();
+        let in_table = match self.hit_off(x, y) {
+            Some(off) => {
+                let mut in_table = false;
+                self.with_edit(|e| {
+                    if e.selection().is_none_or(|r| !r.contains(&off)) {
+                        e.set_caret(off, false, true);
+                    }
+                    in_table = e.in_table();
+                });
+                in_table
+            }
+            None => false,
+        };
+        if let (true, Some(m)) = (in_table, self.imp().table_menu.borrow().as_ref()) {
+            m.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            m.popup();
         }
     }
 
@@ -677,8 +882,12 @@ impl DocView {
             }
             Key::BackSpace => self.with_edit(|e| e.backspace(ctrl)),
             Key::Delete | Key::KP_Delete => self.with_edit(|e| e.delete_forward(ctrl)),
+            Key::Return | Key::KP_Enter | Key::ISO_Enter if ctrl => self.table_op(TableOp::RowBelow),
             Key::Return | Key::KP_Enter | Key::ISO_Enter => self.with_edit(|e| e.newline(shift)),
-            Key::Tab | Key::KP_Tab => self.with_edit(|e| e.insert("    ")),
+            Key::Tab | Key::KP_Tab => self.with_edit(|e| e.tab(shift)),
+            Key::ISO_Left_Tab => self.with_edit(|e| e.tab(true)),
+            Key::k if ctrl => self.with_edit(|e| e.insert_link()),
+            Key::t if ctrl => self.with_edit(|e| e.insert_table()),
             Key::Escape => {
                 self.with_edit(|e| e.clear_caret());
                 self.restart_blink();
@@ -705,6 +914,15 @@ impl DocView {
             move |_, _, x, y| obj.on_release(x, y)
         ));
         self.add_controller(click);
+
+        let context = gtk::GestureClick::new();
+        context.set_button(gdk::BUTTON_SECONDARY);
+        context.connect_pressed(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |_, _, x, y| obj.on_context(x, y)
+        ));
+        self.add_controller(context);
 
         let drag = gtk::GestureDrag::new();
         drag.set_button(gdk::BUTTON_PRIMARY);
@@ -994,4 +1212,10 @@ impl DocView {
         }
         glib::Propagation::Stop
     }
+}
+
+pub fn is_image(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "avif"))
 }

@@ -30,6 +30,23 @@ cargo build --release
 - Enter continues lists (bullets, numbers, task boxes) and quotes; Enter on
   an empty item ends the list. Backspace at the start of an item removes its
   marker, at the start of a paragraph joins it to the one above.
+- Tables are edited in place: the grid stays, only the cell you are in shows
+  its Markdown. Tab/Shift+Tab and the arrow keys move between cells; Enter
+  goes down a row (adding one at the bottom). Right-click for inserting and
+  deleting rows and columns and aligning columns (this rewrites the table
+  with padded columns). `Ctrl+T` inserts a table; typing `| a | b |` and
+  Enter turns the line into one.
+- Tab / Shift+Tab indent and outdent list items, with their sub-items.
+- Smart input: brackets and quotes close themselves (typing the closer steps
+  over it, Backspace removes an empty pair); with text selected, `*`, `_`,
+  `~`, `` ` ``, quotes and brackets wrap it. Enter after ```` ```lang ````
+  adds the closing fence. `Ctrl+K` makes a link; pasting a URL over selected
+  text links it.
+- Paste or drop files to link them (images inline, paths relative to the
+  document); a pasted image is saved as `images/pasted-<time>.png` next to
+  the document.
+- Outline sidebar (`F9` or the header button): headings with the current
+  section highlighted; click one to jump to it.
 - Input goes through the GTK input method, so IME, compose and dead keys work.
 - Undo/redo by word, cut/copy/paste (as Markdown), save/save as, a dirty
   marker in the title, and a prompt before closing unsaved work.
@@ -59,7 +76,11 @@ cargo build --release
 | Save / save as | `Ctrl+S` / `Ctrl+Shift+S` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` |
 | Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` |
-| Bold / italic | `Ctrl+B` / `Ctrl+I` (wraps the selection) |
+| Bold / italic / link | `Ctrl+B` / `Ctrl+I` / `Ctrl+K` (wraps the selection) |
+| Indent / outdent list item | `Tab` / `Shift+Tab` |
+| Table: next / previous cell, row below | `Tab` / `Shift+Tab`, `Enter`; `Ctrl+Enter` inserts a row |
+| Insert table | `Ctrl+T` |
+| Outline sidebar | `F9` |
 | Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
 | Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |
 | Line break inside a block | `Shift+Enter` |
@@ -102,6 +123,7 @@ pessimistic), 750 KB / 2,700-block file:
 | Find across the whole document | 1.8 ms |
 | Keystroke: edit + re-parse + layout (typing into a paragraph) | 0.42 ms median, 1.7 ms max |
 | Keystroke: Enter / undo | 0.07 ms / 0.06 ms median |
+| Keystroke in a 7-row table cell (the table is re-laid out) | 0.42 ms median, 0.7 ms max |
 | Cold start → first frame, Cairo renderer | ~135–150 ms, 59 MB RSS |
 | Cold start → first frame, GL renderer | ~300–400 ms (dominated by GL init) |
 
@@ -138,7 +160,10 @@ scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(
 
 ## Not yet
 
-- Images disappear while their block is shown as source; tables are edited
-  as raw Markdown rather than cell by cell.
-- `Tab` inserts four spaces; there is no list indent/outdent yet.
+- Images disappear while their block is shown as source.
+- Typing in a table doesn't re-pad its columns in the source; row and column
+  operations do. Deleting a selection that spans table cells deletes the
+  pipes too (undo restores them).
+- Ordered lists aren't renumbered in the source after edits (they render
+  correctly).
 - Copy puts Markdown on the clipboard, not rich text.

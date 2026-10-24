@@ -140,10 +140,20 @@ window.folio headerbar {{ background: {bg}; box-shadow: none; border-bottom: 1px
 window.folio headerbar .title {{ font-weight: 600; }}
 window.folio headerbar .subtitle {{ font-size: 0.82em; color: {muted}; }}
 window.folio searchbar > revealer > box {{ background: {bg}; border-bottom: 1px solid {border}; }}
-window.folio .match-count {{ color: {muted}; font-size: 0.9em; }}",
+window.folio .match-count {{ color: {muted}; font-size: 0.9em; }}
+window.folio .outline, window.folio .outline list {{ background: {side}; }}
+window.folio .outline {{ border-right: 1px solid {border}; }}
+window.folio .outline list {{ padding: 8px 0; }}
+window.folio .outline row {{ padding: 4px 10px; margin: 0 8px; border-radius: 6px; color: {fg}; }}
+window.folio .outline row:selected {{ background: {sel}; color: {fg}; }}
+window.folio .outline .top {{ font-weight: 600; }}
+window.folio .outline .dim, window.folio .outline .dim label {{ color: {muted}; }}",
             bg = hex(&self.bg),
             border = hex(&self.border),
             muted = hex(&self.muted),
+            fg = hex(&self.fg),
+            sel = hex(&self.sel),
+            side = hex(&self.code_bg),
         )
     }
 }

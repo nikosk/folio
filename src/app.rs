@@ -45,6 +45,8 @@ fn load(path: &Path) -> std::io::Result<(String, Doc)> {
 
 struct State {
     dark: Cell<bool>,
+    /// Outline sidebar shown; new windows follow the last choice.
+    outline: Cell<bool>,
     css: gtk::CssProvider,
     windows: RefCell<Vec<Weak<Win>>>,
     gsettings: RefCell<Option<gio::Settings>>,
@@ -118,6 +120,7 @@ fn startup(app: &gtk::Application) {
     }
     let st = Rc::new(State {
         dark: Cell::new(dark),
+        outline: Cell::new(false),
         css,
         windows: RefCell::new(Vec::new()),
         gsettings: RefCell::new(settings),
@@ -150,6 +153,7 @@ fn startup(app: &gtk::Application) {
     for (action, accels) in [
         ("app.quit", &["<Ctrl>q"][..]),
         ("app.toggle-theme", &["<Ctrl>d"]),
+        ("win.outline", &["F9"]),
         ("app.new", &["<Ctrl>n"]),
         ("win.open", &["<Ctrl>o"]),
         ("win.save", &["<Ctrl>s"]),
@@ -182,6 +186,10 @@ struct Win {
     reload_timer: RefCell<Option<glib::SourceId>>,
     /// Set once the user chose to close despite unsaved changes.
     closing: Cell<bool>,
+    outline_btn: gtk::ToggleButton,
+    outline_list: gtk::ListBox,
+    /// The headings the list shows: (level, text, source offset).
+    outline: RefCell<Vec<(u8, String, usize)>>,
 }
 
 impl Win {
@@ -218,6 +226,10 @@ impl Win {
         theme_btn.set_tooltip_text(Some("Toggle dark mode (Ctrl+D)"));
         theme_btn.set_action_name(Some("app.toggle-theme"));
         header.pack_end(&theme_btn);
+        let outline_btn = gtk::ToggleButton::new();
+        outline_btn.set_icon_name("sidebar-show-symbolic");
+        outline_btn.set_tooltip_text(Some("Outline (F9)"));
+        header.pack_start(&outline_btn);
         let find_btn = gtk::ToggleButton::new();
         find_btn.set_icon_name("edit-find-symbolic");
         find_btn.set_tooltip_text(Some("Find (Ctrl+F)"));
@@ -248,9 +260,28 @@ impl Win {
             .vexpand(true)
             .child(&view)
             .build();
+        let outline_list = gtk::ListBox::new();
+        outline_list.set_activate_on_single_click(true);
+        outline_list.set_placeholder(Some(&gtk::Label::builder().label("No headings").css_classes(["dim"]).margin_top(12).build()));
+        let outline_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .width_request(240)
+            .child(&outline_list)
+            .build();
+        outline_scroll.add_css_class("outline");
+        let outline_rev = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideRight)
+            .transition_duration(150)
+            .child(&outline_scroll)
+            .build();
+        outline_btn.bind_property("active", &outline_rev, "reveal-child").sync_create().build();
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        hbox.append(&outline_rev);
+        hbox.append(&scroller);
+        scroller.set_hexpand(true);
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         vbox.append(&search);
-        vbox.append(&scroller);
+        vbox.append(&hbox);
         win.set_titlebar(Some(&header));
         win.set_child(Some(&vbox));
         view.set_theme(theme());
@@ -268,6 +299,9 @@ impl Win {
             monitor: RefCell::new(None),
             reload_timer: RefCell::new(None),
             closing: Cell::new(false),
+            outline_btn,
+            outline_list,
+            outline: RefCell::new(Vec::new()),
         });
         state().windows.borrow_mut().push(Rc::downgrade(&w));
         w.setup_actions();
@@ -275,6 +309,7 @@ impl Win {
         w.setup_drop();
         w.setup_links();
         w.setup_editing();
+        w.setup_outline();
         // The window owns the Rc through this handler and drops it on close.
         let keep = RefCell::new(Some(w.clone()));
         w.win.connect_destroy(move |_| {
@@ -287,6 +322,7 @@ impl Win {
                 w.update_titles();
             }
         }
+        w.outline_btn.set_active(state().outline.get());
         crate::mark("window built, document loaded");
         w.win.present();
         crate::mark("presented");
@@ -418,16 +454,21 @@ impl Win {
     fn setup_drop(self: &Rc<Self>) {
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         let weak = Rc::downgrade(self);
-        drop.connect_drop(move |_, value, _, _| {
+        drop.connect_drop(move |_, value, x, y| {
             let Some(w) = weak.upgrade() else { return false };
             let Ok(list) = value.get::<gdk::FileList>() else { return false };
-            match list.files().first().and_then(|f| f.path()) {
-                Some(p) => {
-                    w.open(p, true);
-                    true
+            let files = list.files();
+            // Markdown opens; other files dropped on a document are linked there.
+            let md = files.first().and_then(|f| f.path()).filter(|p| is_markdown(p));
+            match md {
+                Some(p) => w.open(p, true),
+                None => {
+                    let pt = gtk::graphene::Point::new(x as f32, y as f32);
+                    let Some(at) = w.win.compute_point(&w.view, &pt) else { return false };
+                    w.view.drop_files(&files, at.x() as f64, at.y() as f64);
                 }
-                None => false,
             }
+            true
         });
         self.win.add_controller(drop);
     }
@@ -452,11 +493,7 @@ impl Win {
         let (target, frag) = url.split_once('#').unwrap_or((url, ""));
         let base = self.path.borrow().as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
         let path = crate::layout::resolve(&base, target);
-        let is_md = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd" | "txt"));
-        if is_md && path.is_file() {
+        if is_markdown(&path) && path.is_file() {
             self.open(path, true);
             if !frag.is_empty() {
                 self.view.scroll_to_anchor(frag);
@@ -516,7 +553,9 @@ impl Win {
                 self.history.borrow_mut().push(old);
             }
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.view.set_doc(src, doc, base, false);
+        self.view.set_doc(src, doc, base.clone(), false);
+        self.view.set_doc_dir(Some(base));
+        self.refresh_outline();
         self.update_titles();
         self.watch(&path);
         self.refresh_search();
@@ -529,6 +568,7 @@ impl Win {
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         self.view.set_doc(src, doc, base, true);
         self.update_titles();
+        self.refresh_outline();
         self.refresh_search();
     }
 
@@ -559,12 +599,96 @@ impl Win {
         });
     }
 
+    fn setup_outline(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.outline_btn.connect_active_notify(move |b| {
+            state().outline.set(b.is_active());
+            if let Some(w) = weak.upgrade() {
+                w.refresh_outline();
+            }
+        });
+        self.action("outline", |w| w.outline_btn.set_active(!w.outline_btn.is_active()));
+        let weak = Rc::downgrade(self);
+        self.outline_list.connect_row_activated(move |_, row| {
+            let Some(w) = weak.upgrade() else { return };
+            let off = w.outline.borrow().get(row.index() as usize).map(|h| h.2);
+            if let Some(off) = off {
+                w.view.scroll_to_off(off);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.view.connect_scrolled(move || {
+            if let Some(w) = weak.upgrade() {
+                w.highlight_outline();
+            }
+        });
+    }
+
+    /// Rebuild the outline rows if the headings changed (only while shown).
+    fn refresh_outline(&self) {
+        if !self.outline_btn.is_active() {
+            return;
+        }
+        let new: Vec<(u8, String, usize)> = self.view.outline().into_iter().map(|h| (h.level, h.text, h.off)).collect();
+        let same = {
+            let old = self.outline.borrow();
+            old.len() == new.len() && old.iter().zip(&new).all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+        };
+        if !same {
+            while let Some(row) = self.outline_list.row_at_index(0) {
+                self.outline_list.remove(&row);
+            }
+            let top = new.iter().map(|h| h.0).min().unwrap_or(1);
+            for (level, text, _) in &new {
+                let depth = (level - top) as i32;
+                let label = gtk::Label::builder()
+                    .label(text)
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .tooltip_text(text)
+                    .margin_start(14 * depth)
+                    .build();
+                if depth == 0 {
+                    label.add_css_class("top");
+                } else if depth >= 2 {
+                    label.add_css_class("dim");
+                }
+                self.outline_list.append(&label);
+            }
+        }
+        *self.outline.borrow_mut() = new;
+        self.highlight_outline();
+    }
+
+    /// Select the row of the section at the top of the view.
+    fn highlight_outline(&self) {
+        if !self.outline_btn.is_active() {
+            return;
+        }
+        let row = self.view.current_heading().and_then(|i| self.outline_list.row_at_index(i as i32));
+        match &row {
+            Some(r) if !r.is_selected() => {
+                self.outline_list.select_row(Some(r));
+                // Keep it visible in the list without taking focus.
+                if let (Some(b), Some(adj)) = (r.compute_bounds(&self.outline_list), self.outline_list.adjustment()) {
+                    let (y, h) = (b.y() as f64, b.height() as f64);
+                    if y < adj.value() || y + h > adj.value() + adj.page_size() {
+                        adj.set_value(y - adj.page_size() / 3.0);
+                    }
+                }
+            }
+            None => self.outline_list.unselect_all(),
+            _ => {}
+        }
+    }
+
     fn setup_editing(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         self.view.connect_change(move || {
             if let Some(w) = weak.upgrade() {
                 w.update_titles();
                 w.refresh_search();
+                w.refresh_outline();
             }
         });
         let weak = Rc::downgrade(self);
@@ -621,7 +745,9 @@ impl Win {
             let Some(path) = file.path() else { return };
             if w.write(&path) {
                 let path = path.canonicalize().unwrap_or(path);
-                w.view.set_base_dir(path.parent().map(Path::to_path_buf).unwrap_or_default());
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                w.view.set_base_dir(dir.clone());
+                w.view.set_doc_dir(Some(dir));
                 *w.path.borrow_mut() = Some(path.clone());
                 w.watch(&path);
                 w.update_titles();
@@ -705,4 +831,10 @@ impl Win {
         }
         *self.monitor.borrow_mut() = monitor;
     }
+}
+
+fn is_markdown(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd" | "mdx" | "txt"))
 }

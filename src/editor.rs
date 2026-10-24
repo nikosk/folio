@@ -9,6 +9,7 @@
 
 use crate::doc::{self, Block, Cont, Kind, Marker, SrcStyle};
 use crate::layout::{Engine, Pos};
+use crate::table::{self, Grid};
 use std::ops::Range;
 
 pub struct EditState {
@@ -28,6 +29,9 @@ pub struct EditState {
     pub version: u64,
     /// Number of edits that re-parsed the whole document (for `--bench`).
     pub full_parses: usize,
+    /// Offset of a closing bracket or quote that typing inserted: typing it
+    /// steps over it, and Backspace right after the opener removes both.
+    pending_close: Option<usize>,
 }
 
 impl Default for EditState {
@@ -43,6 +47,7 @@ impl Default for EditState {
             group: None,
             version: 0,
             full_parses: 0,
+            pending_close: None,
         }
     }
 }
@@ -52,6 +57,27 @@ struct Active {
     idx: usize,
     /// The rendered blocks it replaced.
     stash: Vec<Block>,
+    /// For a table, which stays rendered: the cell (part) shown as source.
+    cell: Option<usize>,
+}
+
+/// Row and column operations on the table under the caret.
+#[derive(Clone, Copy, Debug)]
+pub enum TableOp {
+    RowAbove,
+    RowBelow,
+    ColLeft,
+    ColRight,
+    DelRow,
+    DelCol,
+    Align(table::Align),
+}
+
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+    /// Source offset of the heading.
+    pub off: usize,
 }
 
 struct Change {
@@ -182,6 +208,55 @@ fn next_item_prefix(prefix: &str) -> String {
     out
 }
 
+/// Length of the blockquote markers (`> > `) at the start of a line.
+fn quote_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let (mut i, mut last) = (0, 0);
+    loop {
+        let mut j = i;
+        while j < b.len() && j - i < 3 && b[j] == b' ' {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'>') {
+            return last;
+        }
+        j += 1;
+        if b.get(j) == Some(&b' ') {
+            j += 1;
+        }
+        (i, last) = (j, j);
+    }
+}
+
+/// The prefix for continuation lines of a block whose first line starts
+/// with `prefix`: quote markers stay, list markers become spaces.
+fn cont_prefix(prefix: &str) -> String {
+    prefix.chars().map(|c| if c == '>' { '>' } else { ' ' }).collect()
+}
+
+/// A cell's range while edited: its text, extended over trailing spaces up
+/// to the caret (but not past `limit`).
+fn cell_reach(r: Range<usize>, limit: usize, caret: Option<usize>) -> Range<usize> {
+    match caret {
+        Some(c) if c > r.end && c <= limit => r.start..c,
+        _ => r,
+    }
+}
+
+fn is_url(s: &str) -> bool {
+    ["http://", "https://", "mailto:"].iter().any(|p| s.starts_with(p) && s.len() > p.len()) && !s.contains(char::is_whitespace)
+}
+
+fn closer(open: char) -> Option<char> {
+    Some(match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' | '`' | '*' | '_' | '~' => open,
+        _ => return None,
+    })
+}
+
 /// Text that could make a local re-parse wrong (HTML blocks that end at
 /// a closing tag rather than a blank line, footnotes, link definitions).
 fn risky(s: &str) -> bool {
@@ -265,6 +340,98 @@ impl Engine {
         self.ed.active.as_ref().map(|a| a.idx)
     }
 
+    /// Source ranges of a table block's cells, in part order. A missing
+    /// cell (short row) sits at the end of its line.
+    fn table_cells(&self, i: usize) -> Vec<Range<usize>> {
+        self.table_cells_limit(i).into_iter().map(|(r, _)| r).collect()
+    }
+
+    /// Cell ranges with how far each may extend while edited (see
+    /// `table::row_cells_limit`): spaces typed at the end of a cell stay in it.
+    fn table_cells_limit(&self, i: usize) -> Vec<(Range<usize>, usize)> {
+        let b = &self.doc.blocks[i];
+        let Kind::Table { aligns, rows } = &b.kind else { return Vec::new() };
+        let cols = aligns.len();
+        let s0 = b.src.start;
+        let prefix = s0 - line_start(&self.src, s0);
+        let mut out = Vec::with_capacity(rows.len() * cols);
+        for (k, (at, line)) in table::lines(&self.src[b.src.clone()], prefix).into_iter().enumerate() {
+            if k == 1 {
+                continue;
+            }
+            let at = s0 + at;
+            let mut cells: Vec<(Range<usize>, usize)> =
+                table::row_cells_limit(line).into_iter().take(cols).map(|(r, l)| (at + r.start..at + r.end, at + l)).collect();
+            let end = at + line.trim_end().len();
+            cells.resize(cols, (end..end, end));
+            out.extend(cells);
+        }
+        out.truncate(rows.len() * cols);
+        out
+    }
+
+    /// The table cell being edited: (block, part, source range). The range
+    /// reaches the caret if it sits in spaces after the text.
+    fn active_cell(&self) -> Option<(usize, usize, Range<usize>)> {
+        let a = self.ed.active.as_ref()?;
+        let k = a.cell?;
+        let (r, limit) = self.table_cells_limit(a.idx).get(k)?.clone();
+        Some((a.idx, k, cell_reach(r, limit, self.ed.caret)))
+    }
+
+    fn table_cols(&self, i: usize) -> usize {
+        match &self.doc.blocks[i].kind {
+            Kind::Table { aligns, .. } => aligns.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn in_table(&self) -> bool {
+        self.active_cell().is_some()
+    }
+
+    /// Headings in document order, for the outline.
+    pub fn outline(&self) -> Vec<Heading> {
+        self.doc
+            .blocks
+            .iter()
+            .filter_map(|b| {
+                let (level, text) = match &b.kind {
+                    Kind::Heading { level, text, .. } => (*level, text.text.clone()),
+                    Kind::Source { rich, style: SrcStyle::Heading(level) } => {
+                        let first = rich.text.lines().next().unwrap_or("").trim();
+                        (*level, first.trim_start_matches('#').trim_end_matches('#').trim().to_string())
+                    }
+                    _ => return None,
+                };
+                Some(Heading { level, text, off: b.src.start })
+            })
+            .collect()
+    }
+
+    /// Index (into `outline()`) of the heading of the section at document y.
+    pub fn heading_at(&mut self, y: f64) -> Option<usize> {
+        let mut cur = None;
+        let mut n = 0;
+        for i in 0..self.len() {
+            if !matches!(self.doc.blocks[i].kind, Kind::Heading { .. } | Kind::Source { style: SrcStyle::Heading(_), .. }) {
+                continue;
+            }
+            if self.block_y(i) > y {
+                break;
+            }
+            cur = Some(n);
+            n += 1;
+        }
+        cur
+    }
+
+    /// Document y of the block containing source offset `off`.
+    pub fn off_y(&mut self, off: usize) -> Option<f64> {
+        let i = self.block_of(off)?;
+        Some(self.block_y(i))
+    }
+
     // ---- the source view ---------------------------------------------
 
     fn deactivate(&mut self) {
@@ -282,10 +449,27 @@ impl Engine {
         if let Some(a) = &self.ed.active {
             let b = &self.doc.blocks[a.idx];
             if b.src.start <= c && c <= b.src.end {
-                return;
+                match a.cell {
+                    None => return,
+                    // Same cell, and its shown text still reaches exactly as far.
+                    Some(k)
+                        if self.table_cells_limit(a.idx).get(k).is_some_and(|(r, l)| {
+                            r.start <= c && c <= r.end.max(*l) && cell_reach(r.clone(), *l, Some(c)).len() == b.part_text(k).len()
+                        }) =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                }
             }
         }
         self.deactivate();
+        if let Some(i) = self.block_of(c)
+            && matches!(self.doc.blocks[i].kind, Kind::Table { .. })
+            && self.activate_table(i, c)
+        {
+            return;
+        }
         let (range, src, like) = match self.block_of(c) {
             Some(i) => {
                 // Blocks sharing source (e.g. from one HTML block) switch together.
@@ -320,7 +504,44 @@ impl Engine {
         let at = range.start;
         let stash: Vec<Block> = self.doc.blocks.splice(range.clone(), [block]).collect();
         self.splice_state(range, 1);
-        self.ed.active = Some(Active { idx: at, stash });
+        self.ed.active = Some(Active { idx: at, stash, cell: None });
+    }
+
+    /// A table keeps its grid while edited: only the cell nearest the caret
+    /// shows its source, and the caret is moved into that cell.
+    fn activate_table(&mut self, i: usize, c: usize) -> bool {
+        let cells = self.table_cells_limit(i);
+        let dist = |(r, l): &(Range<usize>, usize)| if c < r.start { r.start - c } else { c.saturating_sub(r.end.max(*l)) };
+        let Some(k) = (0..cells.len()).min_by_key(|&k| dist(&cells[k])) else { return false };
+        let (r, limit) = cells[k].clone();
+        let cell = cell_reach(r, limit, Some(c));
+        let snapped = c.clamp(cell.start, cell.end);
+        if self.ed.anchor == c {
+            self.ed.anchor = snapped;
+        }
+        self.ed.caret = Some(snapped);
+        let b = &self.doc.blocks[i];
+        let Kind::Table { aligns, rows } = &b.kind else { return false };
+        let cols = aligns.len();
+        let mut rows = rows.clone();
+        if let Kind::Source { rich, .. } = doc::source_kind(&self.src[cell.clone()], &Kind::Para(Default::default())) {
+            rows[k / cols][k % cols] = rich;
+        }
+        let mut map: Vec<[u32; 3]> = b.map.iter().filter(|m| m[0] as usize != k).copied().collect();
+        map.push([k as u32, 0, (cell.start - b.src.start) as u32]);
+        map.sort_unstable();
+        let block = Block {
+            kind: Kind::Table { aligns: aligns.clone(), rows },
+            conts: b.conts.clone(),
+            marker: b.marker,
+            center: b.center,
+            src: b.src.clone(),
+            map,
+        };
+        let stash: Vec<Block> = self.doc.blocks.splice(i..i + 1, [block]).collect();
+        self.splice_state(i..i + 1, 1);
+        self.ed.active = Some(Active { idx: i, stash, cell: Some(k) });
+        true
     }
 
     /// Recompute the painted caret and selection from the offsets.
@@ -348,6 +569,7 @@ impl Engine {
         }
         self.ed.caret = Some(off);
         self.ed.group = None;
+        self.ed.pending_close = None;
         if activate {
             self.refresh_active();
         }
@@ -413,6 +635,26 @@ impl Engine {
             self.set_caret(if forward { r.end } else { r.start }, false, true);
             return;
         }
+        if let Some((i, k, cell)) = self.active_cell() {
+            // Within a cell by character or word; at its edges, to the next cell.
+            let cells = self.table_cells(i);
+            let target = if forward && c >= cell.end {
+                match cells.get(k + 1) {
+                    Some(n) => n.start,
+                    None => self.neighbour(i, true).map_or(c, |n| self.doc.blocks[n].src.start),
+                }
+            } else if !forward && c <= cell.start {
+                match k.checked_sub(1) {
+                    Some(p) => cells[p].end,
+                    None => self.neighbour(i, false).map_or(c, |p| self.doc.blocks[p].src.end),
+                }
+            } else if forward {
+                (if word { next_word(&self.src, c) } else { next_char(&self.src, c) }).min(cell.end)
+            } else {
+                (if word { prev_word(&self.src, c) } else { prev_char(&self.src, c) }).max(cell.start)
+            };
+            return self.set_caret(target, extend, true);
+        }
         let target = match self.active_block() {
             Some(i) => {
                 let src = self.doc.blocks[i].src.clone();
@@ -469,12 +711,22 @@ impl Engine {
 
     /// Replace `r` with `text`, recording undo and leaving the caret after it.
     fn edit(&mut self, r: Range<usize>, text: &str, group: Option<Group>) {
+        self.edit_sel(r, text, group, None)
+    }
+
+    /// Like `edit`, but leaves the selection at `sel` (anchor, caret; offsets
+    /// in the new text) when given.
+    fn edit_sel(&mut self, r: Range<usize>, text: &str, group: Option<Group>, sel: Option<(usize, usize)>) {
         let before = (self.ed.anchor, self.ed.caret.unwrap_or(r.start));
         let del = self.src[r.clone()].to_string();
         let at = r.start;
+        self.ed.pending_close = match self.ed.pending_close {
+            Some(p) if r.start <= p && r.end <= p => Some(p - r.len() + text.len()),
+            _ => None,
+        };
         self.apply(r, text);
         let end = at + text.len();
-        let after = (end, end);
+        let after = sel.unwrap_or((end, end));
         self.ed.redo.clear();
         if self.ed.saved.is_some_and(|s| s > self.ed.undo.len()) {
             self.ed.saved = None;
@@ -506,8 +758,8 @@ impl Engine {
         if !merged {
             self.ed.undo.push(Change { at, del, ins: text.to_string(), before, after });
         }
-        self.ed.caret = Some(end);
-        self.ed.anchor = end;
+        self.ed.anchor = after.0;
+        self.ed.caret = Some(after.1);
         self.ed.goal_x = None;
         self.refresh_active();
         self.sync_view();
@@ -519,10 +771,106 @@ impl Engine {
         Some(self.selection().unwrap_or(c..c))
     }
 
+    /// Several disjoint replacements `(offset, removed length, text)`, sorted,
+    /// as one undo step; caret and anchor stay on the same text.
+    fn multi_edit(&mut self, edits: Vec<(usize, usize, String)>) {
+        let (Some(first), Some(last)) = (edits.first(), edits.last()) else { return };
+        let (start, end) = (first.0, last.0 + last.1);
+        let mut out = String::new();
+        let mut at = start;
+        for (p, n, t) in &edits {
+            out.push_str(&self.src[at..*p]);
+            out.push_str(t);
+            at = p + n;
+        }
+        let map = |o: usize| {
+            let mut d = 0isize;
+            for (p, n, t) in &edits {
+                if o >= p + n {
+                    d += t.len() as isize - *n as isize;
+                } else if o > *p {
+                    return (*p as isize + d) as usize + t.len();
+                }
+            }
+            (o as isize + d) as usize
+        };
+        let c = self.ed.caret.unwrap_or(start);
+        let sel = (map(self.ed.anchor), map(c));
+        self.edit_sel(start..end, &out, None, Some(sel));
+    }
+
+    /// Whether brackets and quotes pair up here (not in code).
+    fn smart_ok(&self) -> bool {
+        self.active_block().is_some_and(|i| !matches!(self.doc.blocks[i].kind, Kind::Source { style: SrcStyle::Code { .. } | SrcStyle::Mono, .. }))
+    }
+
+    /// Typed text: brackets and quotes pair up, a typed closer steps over
+    /// the one that was inserted, and with a selection `*`, `_`, `~`, `` ` ``,
+    /// quotes and brackets wrap it.
+    pub fn type_text(&mut self, text: &str) {
+        let mut it = text.chars();
+        let (Some(ch), None) = (it.next(), it.next()) else { return self.insert(text) };
+        let Some(c) = self.ed.caret else { return };
+        if !self.smart_ok() {
+            return self.insert(text);
+        }
+        if self.selection().is_none() && self.ed.pending_close == Some(c) && self.src[c..].starts_with(ch) && ")]}\"`".contains(ch) {
+            return self.set_caret(c + ch.len_utf8(), false, true);
+        }
+        let Some(close) = closer(ch) else { return self.insert(text) };
+        if let Some(r) = self.selection() {
+            let inner = self.src[r.clone()].to_string();
+            let s = r.start + ch.len_utf8();
+            return self.edit_sel(r, &format!("{ch}{inner}{close}"), None, Some((s, s + inner.len())));
+        }
+        let next = self.src[c..].chars().next();
+        let prev = self.src[..c].chars().next_back();
+        let pairs = match ch {
+            '*' | '_' | '~' => false,
+            '"' => prev.is_none_or(|p| p.is_whitespace() || "([{".contains(p)),
+            '`' => prev != Some('`') && next != Some('`'),
+            _ => true,
+        } && next.is_none_or(|n| n.is_whitespace() || ")]}.,;:!?".contains(n));
+        if !pairs {
+            return self.insert(text);
+        }
+        let after = c + ch.len_utf8();
+        self.edit_sel(c..c, &format!("{ch}{close}"), None, Some((after, after)));
+        self.ed.pending_close = Some(after);
+    }
+
+    /// Pasted text: a URL pasted over a selection links it.
+    pub fn paste_text(&mut self, text: &str) {
+        let url = text.trim();
+        if let Some(r) = self.selection() {
+            let sel = self.src[r].to_string();
+            if is_url(url) && !is_url(&sel) && !sel.contains('\n') {
+                return self.insert(&format!("[{sel}]({url})"));
+            }
+        }
+        self.insert(text)
+    }
+
+    /// Ctrl+K: wrap the selection in a link, ready to type the target.
+    pub fn insert_link(&mut self) {
+        let Some(r) = self.sel_or_caret() else { return };
+        let sel = self.src[r.clone()].to_string();
+        let (text, at) = if is_url(&sel) {
+            (format!("[]({sel})"), r.start + 1)
+        } else {
+            (format!("[{sel}]()"), r.start + sel.len() + 3)
+        };
+        self.edit_sel(r, &text, None, Some((at, at)));
+    }
+
     /// Typed or pasted text replaces the selection.
     pub fn insert(&mut self, text: &str) {
         let Some(r) = self.sel_or_caret() else { return };
-        let text = text.replace("\r\n", "\n");
+        let mut text = text.replace("\r\n", "\n");
+        if self.active_cell().is_some() {
+            // A cell is one line, and a bare pipe would split it.
+            text = text.replace('\n', " ").replace('|', "\\|");
+        }
         let group = (r.is_empty() && text.chars().count() == 1).then_some(Group::Type);
         self.edit(r, &text, group);
     }
@@ -550,7 +898,29 @@ impl Engine {
         if self.delete_selection() {
             return self.newline(soft);
         }
+        if let Some((i, k, _)) = self.active_cell() {
+            // Shift+Enter breaks the line inside the cell; Enter goes down a
+            // row, adding one at the bottom.
+            if soft {
+                return self.edit(c..c, "<br>", None);
+            }
+            let cols = self.table_cols(i);
+            if let Some(r) = self.table_cells(i).get(k + cols) {
+                return self.set_caret(r.end, false, true);
+            }
+            // A new row starts a new record: its first cell.
+            if self.table_op(TableOp::RowBelow)
+                && let Some(a) = self.active_block()
+                && let Some(r) = self.table_cells(a).get((k / cols + 1) * cols)
+            {
+                self.set_caret(r.start, false, true);
+            }
+            return;
+        }
         let Some(i) = self.active_block() else { return };
+        if !soft && (self.complete_fence(i, c) || self.row_to_table(i, c)) {
+            return;
+        }
         let b = &self.doc.blocks[i];
         let (ls, prefix) = self.active_prefix().unwrap_or_default();
         let in_code = matches!(&b.kind, Kind::Source { style: SrcStyle::Code { .. } | SrcStyle::Mono, .. });
@@ -583,9 +953,74 @@ impl Engine {
         self.edit(c..c, &text, None);
     }
 
+    /// Enter at the end of a fence opener (```` ```lang ````) that has no
+    /// closing fence yet: add the closing fence, caret on the line between.
+    fn complete_fence(&mut self, i: usize, c: usize) -> bool {
+        let b = &self.doc.blocks[i];
+        if !matches!(&b.kind, Kind::Source { style: SrcStyle::Code { .. }, .. }) {
+            return false;
+        }
+        let ls = line_start(&self.src, c);
+        let line_end = self.src[c..].find('\n').map_or(self.src.len(), |k| c + k);
+        let body = &self.src[ls..c];
+        let q = quote_len(body);
+        let opener = body[q..].trim_start();
+        let fence: String = opener.chars().take_while(|ch| *ch == '`' || *ch == '~').collect();
+        if ls > b.src.start || fence.len() < 3 || !self.src[c..line_end].trim().is_empty() || opener[fence.len()..].contains(['`', '~']) {
+            return false;
+        }
+        let text = &self.src[b.src.clone()];
+        let closed = text.lines().count() > 1 && text.lines().last().is_some_and(|l| l[quote_len(l)..].trim_start().starts_with(&fence[..3]));
+        if closed {
+            return false;
+        }
+        let indent = cont_prefix(&body[..body.len() - opener.len()]);
+        let at = c + 1 + indent.len();
+        self.edit_sel(c..c, &format!("\n{indent}\n{indent}{fence}"), None, Some((at, at)));
+        true
+    }
+
+    /// Enter after a one-line paragraph like `| a | b |`: make it a table.
+    fn row_to_table(&mut self, i: usize, c: usize) -> bool {
+        let b = &self.doc.blocks[i];
+        let line = &self.src[b.src.clone()];
+        if !matches!(&b.kind, Kind::Source { style: SrcStyle::Text, .. }) || c != b.src.end || line.contains('\n') {
+            return false;
+        }
+        let t = line.trim();
+        if t.len() < 3 || !t.starts_with('|') || !t.ends_with('|') {
+            return false;
+        }
+        let head: Vec<String> = table::row_cells(t).into_iter().map(|r| t[r].to_string()).collect();
+        let g = Grid { aligns: vec![table::Align::None; head.len()], rows: vec![head.clone(), vec![String::new(); head.len()]] };
+        let ls = line_start(&self.src, b.src.start);
+        let (out, cells) = g.render(&cont_prefix(&self.src[ls..b.src.start]));
+        let at = b.src.start + cells[head.len()].start;
+        let r = b.src.clone();
+        self.edit_sel(r, &out, None, Some((at, at)));
+        true
+    }
+
     pub fn backspace(&mut self, word: bool) {
         let Some(c) = self.ed.caret else { return };
         if self.delete_selection() {
+            return;
+        }
+        // Right after typing an opening bracket or quote: remove the pair.
+        if !word && self.ed.pending_close == Some(c) {
+            let open = self.src[..c].chars().next_back();
+            if let Some(o) = open
+                && closer(o).is_some_and(|cl| self.src[c..].starts_with(cl))
+            {
+                let r = c - o.len_utf8()..c + o.len_utf8();
+                return self.edit(r, "", None);
+            }
+        }
+        if let Some((_, _, cell)) = self.active_cell() {
+            if c > cell.start {
+                let to = if word { prev_word(&self.src, c).max(cell.start) } else { prev_char(&self.src, c) };
+                self.edit(to..c, "", Some(Group::Back));
+            }
             return;
         }
         let Some(i) = self.active_block() else { return };
@@ -625,6 +1060,13 @@ impl Engine {
         if self.delete_selection() {
             return;
         }
+        if let Some((_, _, cell)) = self.active_cell() {
+            if c < cell.end {
+                let to = if word { next_word(&self.src, c).min(cell.end) } else { next_char(&self.src, c) };
+                self.edit(c..to, "", Some(Group::Del));
+            }
+            return;
+        }
         let Some(i) = self.active_block() else { return };
         let b = &self.doc.blocks[i];
         if c < b.src.end {
@@ -643,6 +1085,192 @@ impl Engine {
             }
             _ => {}
         }
+    }
+
+    /// Tab: next table cell (a new row after the last), list indent, or
+    /// spaces. Shift+Tab: previous cell or list outdent.
+    pub fn tab(&mut self, back: bool) {
+        if self.ed.caret.is_none() {
+            return;
+        }
+        if let Some((i, k, _)) = self.active_cell() {
+            let cells = self.table_cells(i);
+            if back {
+                if k > 0 {
+                    self.set_caret(cells[k - 1].end, false, true);
+                }
+            } else if k + 1 < cells.len() {
+                self.set_caret(cells[k + 1].end, false, true);
+            } else if self.table_op(TableOp::RowBelow)
+                && let Some(a) = self.active_block()
+            {
+                // Into the first cell of the new row.
+                let cols = self.table_cols(a);
+                if let Some(r) = self.table_cells(a).get((k / cols + 1) * cols) {
+                    self.set_caret(r.start, false, true);
+                }
+            }
+            return;
+        }
+        if !self.list_indent(back) && !back {
+            self.insert("    ");
+        }
+    }
+
+    /// The list item under the caret: (first block, last block, depth index
+    /// of its list in `conts`). The item includes its nested blocks.
+    fn list_item(&self) -> Option<(usize, usize, usize)> {
+        let i = self.active_block()?;
+        let bl = &self.doc.blocks;
+        let k = bl[i].conts.iter().rposition(|c| matches!(c, Cont::List { .. }))?;
+        let base = &bl[i].conts[..=k];
+        let within = |j: usize| bl[j].conts.len() > k && &bl[j].conts[..=k] == base;
+        let is_item = |j: usize| {
+            matches!(bl[j].marker, Some(Marker::Bullet(_) | Marker::Number(_) | Marker::Task(_)))
+                && bl[j].conts.len() == k + 1
+                && within(j)
+        };
+        let mut h = i;
+        while !is_item(h) {
+            h = h.checked_sub(1).filter(|&j| within(j))?;
+        }
+        let mut e = h;
+        while e + 1 < bl.len() && within(e + 1) && !is_item(e + 1) {
+            e += 1;
+        }
+        Some((h, e, k))
+    }
+
+    /// Indent the item under the caret into the previous item's list, or
+    /// outdent it to its parent's level. Returns false outside lists.
+    fn list_indent(&mut self, back: bool) -> bool {
+        let Some((h, e, k)) = self.list_item() else { return false };
+        let bl = &self.doc.blocks;
+        let prefix_of = |j: usize| &self.src[line_start(&self.src, bl[j].src.start)..bl[j].src.start];
+        let indent_of = |p: &str| {
+            let q = quote_len(p);
+            p[q..].len() - p[q..].trim_start_matches(' ').len()
+        };
+        let item_at = |j: usize, depth: usize| {
+            matches!(bl[j].marker, Some(Marker::Bullet(_) | Marker::Number(_) | Marker::Task(_)))
+                && bl[j].conts.len() == depth + 1
+                && bl[j].conts[..=depth] == bl[h].conts[..=depth]
+        };
+        let ls = line_start(&self.src, bl[h].src.start);
+        let mut lines = vec![ls];
+        while let Some(n) = self.src[*lines.last().unwrap()..bl[e].src.end].find('\n') {
+            lines.push(lines.last().unwrap() + n + 1);
+        }
+        let blank = |p: usize| {
+            let l = &self.src[p..self.src[p..].find('\n').map_or(self.src.len(), |n| p + n)];
+            l[quote_len(l)..].trim().is_empty()
+        };
+        let mut edits = Vec::new();
+        if !back {
+            // Nest under the previous item at its content column.
+            let Some(sib) = (0..h).rev().take_while(|&j| bl[j].conts.len() > k && bl[j].conts[..=k] == bl[h].conts[..=k]).find(|&j| item_at(j, k)) else {
+                return true;
+            };
+            let sp = prefix_of(sib);
+            let Some((m, _, _)) = list_marker(sp) else { return true };
+            let tok = sp[m..].find([' ', '\t']).unwrap_or(sp.len() - m);
+            let gap = sp[m + tok..].len() - sp[m + tok..].trim_start().len();
+            let width = tok + gap.clamp(1, 4);
+            for &p in lines.iter().filter(|&&p| !blank(p)) {
+                let q = quote_len(&self.src[p..]);
+                edits.push((p + q, 0, " ".repeat(width)));
+            }
+            // A new nested ordered list starts at 1.
+            let hp = prefix_of(h);
+            if let Some((hm, _, _)) = list_marker(hp) {
+                let digits = hp[hm..].bytes().take_while(u8::is_ascii_digit).count();
+                if digits > 0 {
+                    edits.push((ls + hm, digits, "1".into()));
+                }
+            }
+        } else {
+            let Some(kp) = bl[h].conts[..k].iter().rposition(|c| matches!(c, Cont::List { .. })) else { return true };
+            let Some(parent) = (0..h).rev().find(|&j| item_at(j, kp)) else { return true };
+            let w = indent_of(prefix_of(h)).saturating_sub(indent_of(prefix_of(parent)));
+            for &p in &lines {
+                let q = quote_len(&self.src[p..]);
+                let n = self.src[p + q..].bytes().take(w).take_while(|b| *b == b' ').count();
+                if n > 0 {
+                    edits.push((p + q, n, String::new()));
+                }
+            }
+        }
+        edits.sort_by_key(|e| e.0);
+        self.multi_edit(edits);
+        true
+    }
+
+    /// Insert or delete rows and columns, or align a column, rewriting the
+    /// table with padded columns. Returns false if not in a table.
+    pub fn table_op(&mut self, op: TableOp) -> bool {
+        let Some((i, k, _)) = self.active_cell() else { return false };
+        let b = &self.doc.blocks[i];
+        let ls = line_start(&self.src, b.src.start);
+        let prefix = cont_prefix(&self.src[ls..b.src.start]);
+        let mut g = Grid::parse(&self.src[b.src.clone()], b.src.start - ls);
+        let cols = g.cols();
+        if cols == 0 {
+            return false;
+        }
+        let (mut r, mut col) = (k / cols, k % cols);
+        match op {
+            TableOp::RowAbove => {
+                r = r.max(1);
+                g.rows.insert(r, vec![String::new(); cols]);
+            }
+            TableOp::RowBelow => {
+                r += 1;
+                g.rows.insert(r, vec![String::new(); cols]);
+            }
+            TableOp::ColLeft | TableOp::ColRight => {
+                col += matches!(op, TableOp::ColRight) as usize;
+                g.rows.iter_mut().for_each(|row| row.insert(col, String::new()));
+                g.aligns.insert(col, table::Align::None);
+            }
+            TableOp::DelRow => {
+                if r == 0 {
+                    return false;
+                }
+                g.rows.remove(r);
+                r = r.min(g.rows.len() - 1);
+            }
+            TableOp::DelCol => {
+                if cols == 1 {
+                    return false;
+                }
+                g.rows.iter_mut().for_each(|row| {
+                    row.remove(col);
+                });
+                g.aligns.remove(col);
+                col = col.min(cols - 2);
+            }
+            TableOp::Align(a) => g.aligns[col] = a,
+        }
+        let (out, cells) = g.render(&prefix);
+        let at = b.src.start + cells[r * g.cols() + col].end;
+        let range = b.src.clone();
+        self.edit_sel(range, &out, None, Some((at, at)));
+        true
+    }
+
+    /// Ctrl+T: a 3-column table after the current block (or in place of an
+    /// empty paragraph), with the first header cell selected.
+    pub fn insert_table(&mut self) {
+        let Some(c) = self.ed.caret else { return };
+        let head: Vec<String> = (1..=3).map(|n| format!("Column {n}")).collect();
+        let g = Grid { aligns: vec![table::Align::None; 3], rows: vec![head, vec![String::new(); 3]] };
+        let (out, cells) = g.render("");
+        let (at, before) = match self.active_block().map(|i| self.doc.blocks[i].src.clone()) {
+            Some(r) if !r.is_empty() => (r.end, "\n\n"),
+            _ => (c, ""),
+        };
+        let base = at + before.len();
+        self.edit_sel(at..at, &format!("{before}{out}"), None, Some((base + cells[0].start, base + cells[0].end)));
     }
 
     pub fn selected_source(&self) -> String {
@@ -946,6 +1574,116 @@ mod tests {
         assert_eq!(b.src_to_text(6), (0, 5)); // inside "**" clamps to the run
     }
 
+    /// Run keys: chars are typed (smart input), `\n` Enter, `\t` Tab,
+    /// `\u{1}` Shift+Tab, `\u{8}` Backspace.
+    fn keys(src: &str, at: usize, keys: &str) -> Engine {
+        let mut e = engine(src);
+        e.set_caret(at, false, true);
+        for ch in keys.chars() {
+            match ch {
+                '\n' => e.newline(false),
+                '\t' => e.tab(false),
+                '\u{1}' => e.tab(true),
+                '\u{8}' => e.backspace(false),
+                c => e.type_text(&c.to_string()),
+            }
+            check(&e);
+        }
+        e
+    }
+
+    fn caret_at(e: &Engine) -> String {
+        let c = e.ed.caret.unwrap();
+        format!("{}|{}", &e.src[..c], &e.src[c..])
+    }
+
+    #[test]
+    fn list_indent_and_outdent() {
+        let e = keys("- a\n- b\n  - c\n", 7, "\t");
+        assert_eq!(caret_at(&e), "- a\n  - b|\n    - c\n");
+        let e = keys("- a\n- b\n  - c\n", 7, "\t\u{1}");
+        assert_eq!(caret_at(&e), "- a\n- b|\n  - c\n");
+        // Ordered items nest at their content column and restart at 1.
+        let e = keys("1. a\n2. b\n", 9, "\t");
+        assert_eq!(e.src, "1. a\n   1. b\n");
+        let e = keys("> - a\n> - b\n", 11, "\t");
+        assert_eq!(e.src, "> - a\n>   - b\n");
+        // The first item has nothing to nest under; outside lists Tab is spaces.
+        assert_eq!(keys("- a\n", 3, "\t").src, "- a\n");
+        assert_eq!(keys("text\n", 4, "\t").src, "text    \n");
+    }
+
+    #[test]
+    fn brackets_and_quotes_pair() {
+        let e = keys("x\n", 1, " (a)");
+        assert_eq!(caret_at(&e), "x (a)|\n");
+        let e = keys("x\n", 1, " (\u{8}");
+        assert_eq!(caret_at(&e), "x |\n");
+        // No pairing before a word, or for an apostrophe-like quote mid-word.
+        assert_eq!(keys("word\n", 0, "(").src, "(word\n");
+        assert_eq!(keys("ab\n", 1, "\"").src, "a\"b\n");
+        // A selection is wrapped and stays selected.
+        let mut e = engine("make bold\n");
+        e.select_range(5..9);
+        e.type_text("*");
+        e.type_text("*");
+        assert_eq!(e.src, "make **bold**\n");
+        assert_eq!(e.selection(), Some(7..11));
+    }
+
+    #[test]
+    fn fences_and_tables_from_enter() {
+        let e = keys("x\n\n", 3, "```rs\nfn");
+        assert_eq!(caret_at(&e), "x\n\n```rs\nfn|\n```");
+        let e = keys("x\n\n", 3, "| a | b |\nq");
+        assert_eq!(e.src, "x\n\n| a   | b   |\n| --- | --- |\n| q    |     |");
+    }
+
+    #[test]
+    fn table_cells_edit_in_place() {
+        let src = "| a | b |\n|---|---|\n| c |  |\n";
+        // Clicking into the delimiter row lands in the nearest cell.
+        let mut e = keys(src, 12, "");
+        assert_eq!(e.active_cell().map(|c| c.1), Some(1));
+        // Typing goes into the cell; a pipe is escaped; Tab moves on.
+        let e2 = keys(src, 4, "x|\ty");
+        assert_eq!(e2.src, "| ax\\| | by |\n|---|---|\n| c |  |\n");
+        assert!(matches!(e2.doc.blocks[0].kind, Kind::Table { .. }));
+        // Tab from the last cell adds a row; Enter in the last row too.
+        e.set_caret(src.find("|  |").unwrap() + 2, false, true);
+        e.tab(false);
+        e.type_text("z");
+        assert_eq!(e.src, "| a   | b   |\n| --- | --- |\n| c   |     |\n| z    |     |\n");
+        check(&e);
+        assert!(e.table_op(TableOp::ColRight));
+        assert!(e.table_op(TableOp::Align(table::Align::Center)));
+        // The caret is in column 0: the new column goes right of it.
+        assert_eq!(e.src, "| a   |     | b   |\n| --- | :-: | --- |\n| c   |     |     |\n| z   |     |     |\n");
+        assert!(!e.table_op(TableOp::DelRow) || e.src.lines().count() == 3);
+        check(&e);
+    }
+
+    #[test]
+    fn table_cell_keeps_typed_spaces_and_moves_by_row() {
+        let src = "| a | b |\n|---|---|\n| c | d |\n";
+        let mut e = keys(src, 3, " x");
+        assert_eq!(e.src, "| a x | b |\n|---|---|\n| c | d |\n");
+        e.move_v(true, false);
+        assert_eq!(e.active_cell().map(|c| c.1), Some(2));
+        e.move_v(false, false);
+        assert_eq!(e.active_cell().map(|c| c.1), Some(0));
+    }
+
+    #[test]
+    fn outline_lists_headings() {
+        let mut e = engine("# One\n\ntext\n\n## Two *b*\n");
+        e.set_caret(2, false, true);
+        let o: Vec<(u8, String)> = e.outline().into_iter().map(|h| (h.level, h.text)).collect();
+        assert_eq!(o, [(1, "One".into()), (2, "Two b".into())]);
+        assert_eq!(e.heading_at(0.0), None);
+        assert_eq!(e.heading_at(1e6), Some(1));
+    }
+
     #[test]
     fn empty_document() {
         let e = typed("", 0, "# Title\nbody\n- a\nb");
@@ -994,7 +1732,27 @@ mod fuzz {
             };
             for _ in 0..300 {
                 let before = (e.src.clone(), e.ed.caret);
-                let op = match next(10) {
+                let op = match next(15) {
+                    10 => {
+                        e.tab(false);
+                        "tab".into()
+                    }
+                    11 => {
+                        e.tab(true);
+                        "shift-tab".into()
+                    }
+                    12 | 13 => {
+                        let c = "()[]\"`*|x ".chars().nth(next(10)).unwrap().to_string();
+                        e.type_text(&c);
+                        format!("type {c:?}")
+                    }
+                    14 => {
+                        use table::Align::*;
+                        let ops = [TableOp::RowAbove, TableOp::RowBelow, TableOp::ColLeft, TableOp::ColRight, TableOp::DelRow, TableOp::DelCol, TableOp::Align(Center), TableOp::Align(None)];
+                        let o = ops[next(ops.len())];
+                        e.table_op(o);
+                        format!("{o:?}")
+                    }
                     0 => {
                         let at = next(e.src.len() + 1);
                         e.set_caret(at, false, true);

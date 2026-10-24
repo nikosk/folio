@@ -179,7 +179,7 @@ fn bench_typing(e: &mut Engine, h: f64) -> Vec<(&'static str, Vec<Duration>)> {
     let mut typing = Vec::new();
     for _ in 0..4 {
         for c in text.chars() {
-            typing.push(key(e, &|e| e.insert(&c.to_string())));
+            typing.push(key(e, &|e| e.type_text(&c.to_string())));
         }
     }
     let mut back = Vec::new();
@@ -197,5 +197,21 @@ fn bench_typing(e: &mut Engine, h: f64) -> Vec<(&'static str, Vec<Duration>)> {
             e.undo();
         }));
     }
-    vec![("typing", typing), ("backspace", back), ("enter+char", enter), ("undo", undo)]
+    // A table stays rendered while edited, so each key lays out all its cells.
+    let mut cell = Vec::new();
+    let mid = e.src.len() / 2;
+    if let Some(t) = (0..e.len()).find(|&k| matches!(e.doc.blocks[k].kind, crate::doc::Kind::Table { .. }) && e.doc.blocks[k].src.start > mid) {
+        let at = e.doc.blocks[t].src.start + 2;
+        e.set_caret(at, false, true);
+        let y = e.pos_y(e.caret_pos().unwrap());
+        e.ensure((y - h / 2.0).max(0.0), y + h / 2.0);
+        for c in "quick brown fox".chars() {
+            cell.push(key(e, &|e| e.type_text(&c.to_string())));
+        }
+    }
+    let mut out = vec![("typing", typing), ("backspace", back), ("enter+char", enter), ("undo", undo)];
+    if !cell.is_empty() {
+        out.push(("table cell", cell));
+    }
+    out
 }

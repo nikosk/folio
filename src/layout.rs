@@ -905,6 +905,12 @@ impl Engine {
         }
     }
 
+    /// Document y of the top of block `i`'s content.
+    pub fn block_y(&mut self, i: usize) -> f64 {
+        self.update_ys();
+        self.ys[i] + self.gap[i]
+    }
+
     /// Caret rectangle of a position: (x in widget coords, document y, height).
     pub fn caret_rect(&mut self, p: Pos) -> Option<(f64, f64, f64)> {
         if p.block >= self.len() {
@@ -925,7 +931,12 @@ impl Engine {
     pub fn vmove(&mut self, p: Pos, down: bool, goal_x: f64) -> Option<Pos> {
         let (_, mut y, mut h) = self.caret_rect(p)?;
         let top = self.ys[p.block] + self.gap[p.block];
-        if let Some(part) = self.cache[p.block].as_ref().and_then(|l| l.parts.get(p.part)) {
+        // Where to look instead when leaving the part: the next row of parts
+        // (table cells) or, with none, past the block's edge.
+        let mut beyond = None;
+        if let Some(laid) = self.cache[p.block].as_ref()
+            && let Some(part) = laid.parts.get(p.part)
+        {
             // Use the whole line box: it is taller than the caret.
             let (line, _) = part.l.index_to_line_x(part.layout_idx(p.idx, true) as i32, false);
             let mut it = part.l.iter();
@@ -934,8 +945,22 @@ impl Engine {
             }
             let (y0, y1) = it.line_yrange();
             (y, h) = (top + part.y + px(y0), px(y1 - y0));
+            let edge = if down { line + 1 >= part.l.line_count() } else { line == 0 };
+            if edge && laid.parts.len() > 1 {
+                let row = if down {
+                    laid.parts.iter().filter(|q| q.y >= part.y + part.h - 0.5).map(|q| q.y).min_by(f64::total_cmp).map(|qy| top + qy + 1.0)
+                } else {
+                    laid.parts.iter().filter(|q| q.y + q.h <= part.y + 0.5).map(|q| q.y + q.h).max_by(f64::total_cmp).map(|qb| top + qb - 1.0)
+                };
+                beyond = Some(row.unwrap_or(if down { top + laid.h + 1.0 } else { self.ys[p.block] - 0.5 }));
+            }
         }
-        let ty = if down { y + h + 1.0 } else if y - 1.0 < top { self.ys[p.block] - 0.5 } else { y - 1.0 };
+        let ty = match beyond {
+            Some(t) => t,
+            None if down => y + h + 1.0,
+            None if y - 1.0 < top => self.ys[p.block] - 0.5,
+            None => y - 1.0,
+        };
         if ty < 0.0 || (!down && p.block == 0 && y - 1.0 < top) {
             return Some(Pos { idx: 0, ..p });
         }

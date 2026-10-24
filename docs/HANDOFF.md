@@ -66,12 +66,26 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   swallowing everything in between (a v1 bug, now fixed).
 - **Reading mode:** with no caret (on open, or after `Esc`) the v1 scroll
   keys work; a click starts editing. While editing, links need Ctrl+click.
+- **Tables** stay `Kind::Table` while edited: `activate_table` swaps only the
+  caret's cell for its source (`Active::cell`), and the caret is kept inside
+  that cell's text (`table_cells_limit`; a cell may extend over spaces typed
+  at its end). Cell ranges come from `table.rs`, which also rewrites a whole
+  table for row/column operations (`Grid::render`).
+- **Smart input** is `Engine::type_text` (typed keys only; paste goes through
+  `paste_text`). `EditState::pending_close` remembers an auto-inserted closer
+  so typing it steps over and Backspace removes the pair.
+- **Lists:** `list_item` finds the item (with its nested blocks) under the
+  caret, `list_indent` rewrites its lines with `multi_edit` (several edits,
+  one undo step, caret mapped through them).
+- **Outline:** `Engine::outline` / `heading_at`; the window keeps a `ListBox`
+  in a `Revealer` and rebuilds rows only when heading text changes.
 
 Next steps, roughly in priority order:
 
-1. Show the image under its source while an image block is active; tables
-   edited cell by cell instead of as raw text.
-2. List indent/outdent on Tab/Shift+Tab; renumber ordered lists after edits.
+1. Show the image under its source while an image block is active.
+2. Renumber ordered lists after edits; re-pad a table's columns when the
+   caret leaves it (as one undo step); make a selection across table cells
+   clear the cells instead of deleting pipes.
 3. Typing in documents with footnotes or link definitions re-parses
    everything (~5 ms on 750 KB); make footnotes/refs incremental if that
    matters in practice.
@@ -152,7 +166,13 @@ The agent's shell has no display. What works:
   pointer events through Mutter's RemoteDesktop D-Bus API (so the input method
   path is exercised) and screenshots after `DELAY` ms. One D-Bus connection
   must hold the session (separate `gdbus call`s lose it), and a button press
-  needs a short pause before its release.
+  needs a short pause before its release. Quirks: named keys must be sent as
+  keycodes (as keysyms, keys that are also on the keypad arrive wrong or not
+  at all); `Esc` and `F9` never reach the app even as keycodes, so test the
+  outline with its button (or `gdbus call … org.gtk.Actions.Activate outline`
+  on `/dev/folio/Folio/window/1`); the pointer must not touch the top-left
+  hot corner; and window placement varies between runs, so a click can miss
+  (retry). Popovers are separate surfaces and don't appear in screenshots.
 - `folio --render out.png --caret OFFSET FILE` renders with the source view of
   the block at OFFSET.
   `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this

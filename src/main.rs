@@ -5,6 +5,7 @@ mod headless;
 mod highlight;
 mod layout;
 mod paint;
+mod table;
 mod tex;
 mod theme;
 mod view;

@@ -1675,6 +1675,18 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_in_a_cell() {
+        let src = "# S\n\n| Item | Qty |\n|---|--:|\n| Apples | 6 |\n";
+        let mut e = engine(src);
+        let at = src.find("ples").unwrap();
+        e.set_caret(at, false, true);
+        e.move_line_edge(true, false);
+        assert_eq!(e.ed.caret, Some(at + 4));
+        e.move_line_edge(false, false);
+        assert_eq!(e.ed.caret, Some(at - 2));
+    }
+
+    #[test]
     fn outline_lists_headings() {
         let mut e = engine("# One\n\ntext\n\n## Two *b*\n");
         e.set_caret(2, false, true);

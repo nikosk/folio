@@ -168,7 +168,8 @@ The agent's shell has no display. What works:
   must hold the session (separate `gdbus call`s lose it), and a button press
   needs a short pause before its release. Quirks: named keys must be sent as
   keycodes (as keysyms, keys that are also on the keypad arrive wrong or not
-  at all); `Esc` and `F9` never reach the app even as keycodes, so test the
+  at all), and even then `End` is sometimes dropped, so cover navigation in
+  unit tests; `Esc` and `F9` never reach the app even as keycodes, so test the
   outline with its button (or `gdbus call … org.gtk.Actions.Activate outline`
   on `/dev/folio/Folio/window/1`); the pointer must not touch the top-left
   hot corner; and window placement varies between runs, so a click can miss

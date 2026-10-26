@@ -187,8 +187,8 @@ The agent's shell has no display. What works:
 CI (`.github/workflows/release.yml`) runs on `v*` tags, pull requests and
 manual dispatch, not on pushes to `main`. A `v*` tag tests, builds and
 publishes a GitHub Release with an x86_64 tarball. Bump `Cargo.toml`'s
-version first. The repo (`nikosk/folio`) is private, so runs (~1 min each
-with the cache warm) count against the Actions minutes.
+version first. The repo (`nikosk/folio`) is public, so Actions runs (~1 min
+each with the cache warm) are free. There is no LICENSE yet.
 
 ## Known v1 limitations
 

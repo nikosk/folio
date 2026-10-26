@@ -52,8 +52,9 @@ cargo build --release
 - Outline sidebar (`F9` or the header button): headings with the current
   section highlighted; click one to jump to it.
 - Input goes through the GTK input method, so IME, compose and dead keys work.
-- The header menu copies the file's path, shows it in the file manager, or
-  opens it in another app (the system's "Open With" chooser).
+- The header menu (left) opens files, copies the current file's path, shows
+  it in the file manager, or opens it in another app (the system's "Open
+  With" chooser).
 - Undo/redo by word, cut/copy/paste (as Markdown), save/save as, a dirty
   marker in the title, and a prompt before closing unsaved work.
 

@@ -215,10 +215,19 @@ impl Win {
 
         let header = gtk::HeaderBar::new();
         header.set_title_widget(Some(&titles));
-        let open = gtk::Button::from_icon_name("document-open-symbolic");
-        open.set_tooltip_text(Some("Open… (Ctrl+O)"));
-        open.set_action_name(Some("win.open"));
-        header.pack_start(&open);
+        let file_menu = gio::Menu::new();
+        file_menu.append(Some("Open…"), Some("win.open"));
+        let this_file = gio::Menu::new();
+        this_file.append(Some("Copy Path"), Some("win.copy-path"));
+        this_file.append(Some("Show in Files"), Some("win.show-in-files"));
+        this_file.append(Some("Open With…"), Some("win.open-with"));
+        file_menu.append_section(None, &this_file);
+        let menu_btn = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("File")
+            .menu_model(&file_menu)
+            .build();
+        header.pack_start(&menu_btn);
         let new = gtk::Button::from_icon_name("document-new-symbolic");
         new.set_tooltip_text(Some("New (Ctrl+N)"));
         new.set_action_name(Some("app.new"));
@@ -231,16 +240,6 @@ impl Win {
         outline_btn.set_icon_name("sidebar-show-symbolic");
         outline_btn.set_tooltip_text(Some("Outline (F9)"));
         header.pack_start(&outline_btn);
-        let file_menu = gio::Menu::new();
-        file_menu.append(Some("Copy Path"), Some("win.copy-path"));
-        file_menu.append(Some("Show in Files"), Some("win.show-in-files"));
-        file_menu.append(Some("Open With…"), Some("win.open-with"));
-        let menu_btn = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .tooltip_text("File")
-            .menu_model(&file_menu)
-            .build();
-        header.pack_end(&menu_btn);
         let find_btn = gtk::ToggleButton::new();
         find_btn.set_icon_name("edit-find-symbolic");
         find_btn.set_tooltip_text(Some("Find (Ctrl+F)"));

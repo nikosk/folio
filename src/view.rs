@@ -1173,13 +1173,15 @@ impl DocView {
     fn on_key(&self, key: Key, state: ModifierType) -> glib::Propagation {
         let ctrl = state.contains(ModifierType::CONTROL_MASK);
         let shift = state.contains(ModifierType::SHIFT_MASK);
+        // Ctrl+Alt+C is Copy Path.
+        let alt = state.contains(ModifierType::ALT_MASK);
         self.imp().cursor_ctrl.set(ctrl || matches!(key, Key::Control_L | Key::Control_R));
         if self.editing() {
             if self.on_edit_key(key, state) {
                 return glib::Propagation::Stop;
             }
             return match key {
-                Key::c | Key::C | Key::Insert if ctrl => {
+                Key::c | Key::C | Key::Insert if ctrl && !alt => {
                     self.copy();
                     glib::Propagation::Stop
                 }
@@ -1193,7 +1195,7 @@ impl DocView {
         let h = self.height() as f64;
         let line = 3.0 * 16.0 * self.zoom();
         match key {
-            Key::c | Key::C | Key::Insert if ctrl => self.copy(),
+            Key::c | Key::C | Key::Insert if ctrl && !alt => self.copy(),
             Key::a | Key::A if ctrl => self.select_all(),
             Key::Up | Key::k => self.scroll_by(-line),
             Key::Down | Key::j => self.scroll_by(line),

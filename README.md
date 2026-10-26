@@ -13,6 +13,10 @@ glibc 2.39+ (Ubuntu 24.04, Fedora 40 or newer).
 tar xzf folio-*-x86_64-linux.tar.gz && ./folio-*/install.sh
 ```
 
+To update later, run `folio --update` (from 0.4.0 on). It fetches the latest
+release with `curl` or `wget`, checks its SHA-256 and runs its `install.sh`;
+restart Folio afterwards.
+
 ## Build & run
 
 ```sh
@@ -48,6 +52,8 @@ cargo build --release
 - Outline sidebar (`F9` or the header button): headings with the current
   section highlighted; click one to jump to it.
 - Input goes through the GTK input method, so IME, compose and dead keys work.
+- The header menu copies the file's path, shows it in the file manager, or
+  opens it in another app (the system's "Open With" chooser).
 - Undo/redo by word, cut/copy/paste (as Markdown), save/save as, a dirty
   marker in the title, and a prompt before closing unsaved work.
 
@@ -81,6 +87,7 @@ cargo build --release
 | Table: next / previous cell, row below | `Tab` / `Shift+Tab`, `Enter`; `Ctrl+Enter` inserts a row |
 | Insert table | `Ctrl+T` |
 | Outline sidebar | `F9` |
+| Copy file path | `Ctrl+Alt+C` |
 | Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
 | Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |
 | Line break inside a block | `Shift+Enter` |
@@ -155,6 +162,7 @@ scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(
 | `src/layout.rs` | Layout engine: lazy per-block Pango layout, virtual heights, painting, hit-testing, selection, find |
 | `src/view.rs` | GTK widget (`GtkScrollable`): scrolling, input, async image loading |
 | `src/app.rs` | Windows, actions, file loading, live reload, theme |
+| `src/update.sh` | `folio --update` (embedded in the binary) |
 | `src/paint.rs` | Drawing backends: GTK snapshot (GPU) and Cairo (headless) |
 | `src/highlight.rs`, `src/tex.rs` | Code highlighting, TeX → Unicode |
 

@@ -24,6 +24,7 @@ doesn't say.
 | **GPU renderer (GTK default)** | Decided after measuring. In headless tests the Cairo renderer reached first frame in ~140 ms vs ~300–400 ms on GL, but it rasterises every frame on the CPU (8–13 ms per frame at 1000–2000 px), which risks stutter on large or HiDPI screens. Don't force `GSK_RENDERER`. |
 | Single-instance GApplication | A second launch hands the file to the running process over D-Bus. |
 | Remote images not fetched | No network code. Remote images render as link chips. |
+| `folio --update` is a shell script | Keeps network code out of the binary: `src/update.sh` (embedded with `include_str!`) uses curl or wget, checks the release's `.sha256` and runs the release's `install.sh`, which installs to `~/.local/bin`. It depends on the release asset names in `release.yml`. No update check at startup (startup speed, no network). |
 
 ## v2 status
 

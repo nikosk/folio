@@ -32,6 +32,20 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--render" || a == "--bench") {
         return headless::run(&args);
     }
+    if args.iter().any(|a| a == "--version") {
+        println!("folio {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    // Folio has no network code; updating is a shell script using curl or wget.
+    if args.iter().any(|a| a == "--update") {
+        let status = std::process::Command::new("sh")
+            .args(["-c", include_str!("update.sh"), "sh", env!("CARGO_PKG_VERSION")])
+            .status();
+        return match status {
+            Ok(s) if s.success() => ExitCode::SUCCESS,
+            _ => ExitCode::FAILURE,
+        };
+    }
     // Start reading and parsing the file while GTK initialises.
     if let Some(f) = args.iter().find(|a| !a.starts_with('-')) {
         app::preload(Path::new(f));

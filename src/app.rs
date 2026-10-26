@@ -167,6 +167,7 @@ fn startup(app: &gtk::Application) {
         ("win.zoom-reset", &["<Ctrl>0", "<Ctrl>KP_0"]),
         ("win.reload", &["<Ctrl>r", "F5"]),
         ("win.back", &["<Alt>Left"]),
+        ("win.copy-path", &["<Ctrl><Alt>c"]),
     ] {
         app.set_accels_for_action(action, accels);
     }
@@ -230,6 +231,16 @@ impl Win {
         outline_btn.set_icon_name("sidebar-show-symbolic");
         outline_btn.set_tooltip_text(Some("Outline (F9)"));
         header.pack_start(&outline_btn);
+        let file_menu = gio::Menu::new();
+        file_menu.append(Some("Copy Path"), Some("win.copy-path"));
+        file_menu.append(Some("Show in Files"), Some("win.show-in-files"));
+        file_menu.append(Some("Open With…"), Some("win.open-with"));
+        let menu_btn = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("File")
+            .menu_model(&file_menu)
+            .build();
+        header.pack_end(&menu_btn);
         let find_btn = gtk::ToggleButton::new();
         find_btn.set_icon_name("edit-find-symbolic");
         find_btn.set_tooltip_text(Some("Find (Ctrl+F)"));
@@ -390,6 +401,13 @@ impl Win {
         self.action("zoom-out", |w| w.view.set_zoom(w.view.zoom() / 1.1));
         self.action("zoom-reset", |w| w.view.set_zoom(1.0));
         self.action("reload", |w| w.reload());
+        self.action("copy-path", |w| {
+            if let Some(p) = w.path.borrow().as_ref() {
+                w.win.clipboard().set_text(&p.to_string_lossy());
+            }
+        });
+        self.action("show-in-files", |w| w.launch(false));
+        self.action("open-with", |w| w.launch(true));
         self.action("back", |w| {
             let prev = w.history.borrow_mut().pop();
             if let Some(p) = prev {
@@ -776,6 +794,26 @@ impl Win {
         }
     }
 
+    /// Shows the file in the file manager, or opens it in an app the user picks.
+    fn launch(self: &Rc<Self>, choose_app: bool) {
+        let Some(path) = self.path.borrow().clone() else { return };
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
+        let win = self.win.clone();
+        let done = move |r: Result<(), glib::Error>| {
+            if let Err(e) = r
+                && !e.matches(gtk::DialogError::Dismissed)
+            {
+                gtk::AlertDialog::builder().message("Could not open the file").detail(e.message()).build().show(Some(&win));
+            }
+        };
+        if choose_app {
+            launcher.set_always_ask(true);
+            launcher.launch(Some(&self.win), gio::Cancellable::NONE, done);
+        } else {
+            launcher.open_containing_folder(Some(&self.win), gio::Cancellable::NONE, done);
+        }
+    }
+
     fn display_name(&self) -> String {
         match self.path.borrow().as_ref() {
             Some(p) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into()),
@@ -803,6 +841,11 @@ impl Win {
         self.subtitle.set_text(&dir);
         self.subtitle.set_visible(!dir.is_empty());
         self.win.set_title(Some(&format!("{dirty}{name} — Folio")));
+        for a in ["copy-path", "show-in-files", "open-with"] {
+            if let Some(a) = self.win.lookup_action(a).and_downcast::<gio::SimpleAction>() {
+                a.set_enabled(path.is_some());
+            }
+        }
     }
 
     fn watch(self: &Rc<Self>, path: &Path) {

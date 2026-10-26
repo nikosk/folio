@@ -81,7 +81,8 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
 - **Outline:** `Engine::outline` / `heading_at`; the window keeps a `ListBox`
   in a `Revealer` and rebuilds rows only when heading text changes.
 
-Next steps, roughly in priority order:
+Next steps for existing features, roughly in priority order (new features
+are in `docs/ROADMAP.md`):
 
 1. Show the image under its source while an image block is active.
 2. Renumber ordered lists after edits; re-pad a table's columns when the
@@ -93,7 +94,7 @@ Next steps, roughly in priority order:
 4. The source view of a heading or paragraph appears instantly on click and
    can shift text horizontally (syntax becomes visible); consider a short
    transition or keeping the click point fixed.
-5. Rich-text copy (HTML) alongside Markdown; a release (bump `Cargo.toml`).
+5. Rich-text copy (HTML) alongside Markdown (planned for 0.7 in the roadmap).
 
 ## Architecture
 

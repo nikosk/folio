@@ -164,6 +164,13 @@ window.folio .files row:hover {{ background: alpha({fg}, 0.06); }}
 window.folio .files treeexpander {{ padding: 3px 8px 3px 4px; border-radius: 6px; }}
 window.folio .files treeexpander.current {{ background: {sel}; font-weight: 600; }}
 window.folio .files image {{ color: {muted}; }}
+window.folio .files .git-badge {{ font-size: 0.8em; font-weight: 700; margin-left: 4px; min-width: 1em; }}
+window.folio .files .git-badge.dot {{ font-size: 0.55em; }}
+window.folio .files .git-new {{ color: {green}; }}
+window.folio .files .git-staged {{ color: {accent}; }}
+window.folio .files .git-modified {{ color: {amber}; }}
+window.folio .files .git-conflict {{ color: {red}; }}
+window.folio .files treeexpander.git-ignored {{ opacity: 0.5; }}
 window.folio .quick-open {{ background: {bg}; border: 1px solid {border}; border-radius: 10px; padding: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.22); }}
 window.folio .quick-open list {{ background: transparent; }}
 window.folio .quick-open row {{ padding: 5px 8px; border-radius: 6px; color: {fg}; }}
@@ -176,6 +183,10 @@ window.folio .quick-open .dim {{ color: {muted}; font-size: 0.9em; }}",
             fg = hex(&self.fg),
             sel = hex(&self.sel),
             side = hex(&self.code_bg),
+            accent = hex(&self.accent),
+            green = hex(&self.alerts[1]),
+            amber = hex(&self.alerts[3]),
+            red = hex(&self.alerts[4]),
         )
     }
 }

@@ -739,6 +739,7 @@ impl Win {
         self.update_titles();
         self.refresh_outline();
         self.refresh_search();
+        self.refresh_git();
     }
 
     /// The file changed on disk: reload, unless it is our own save or
@@ -778,14 +779,27 @@ impl Win {
     }
 
     /// Update the files sidebar (only while it is shown).
+    fn files_shown(&self) -> bool {
+        self.side_btn.is_active() && self.side_stack.visible_child_name().as_deref() == Some("files")
+    }
+
     fn refresh_files(&self) {
-        if !self.side_btn.is_active() || self.side_stack.visible_child_name().as_deref() != Some("files") {
+        if !self.files_shown() {
             return;
         }
         if let Some(root) = self.root.borrow().as_ref() {
             self.files.set_root(root);
         }
         self.files.set_current(self.path.borrow().as_deref());
+        self.files.refresh_git();
+    }
+
+    /// Files may have changed (saved, reloaded, or edited elsewhere while
+    /// the window was in the background): update the git markings.
+    fn refresh_git(&self) {
+        if self.files_shown() {
+            self.files.refresh_git();
+        }
     }
 
     fn setup_outline(self: &Rc<Self>) {
@@ -814,6 +828,12 @@ impl Win {
             }
         });
         self.action("sidebar", |w| w.side_btn.set_active(!w.side_btn.is_active()));
+        let weak = Rc::downgrade(self);
+        self.win.connect_is_active_notify(move |win| {
+            if let (true, Some(w)) = (win.is_active(), weak.upgrade()) {
+                w.refresh_git();
+            }
+        });
         let weak = Rc::downgrade(self);
         self.outline_list.connect_row_activated(move |_, row| {
             let Some(w) = weak.upgrade() else { return };
@@ -971,6 +991,7 @@ impl Win {
         match file.replace_contents(src.as_bytes(), None, false, gio::FileCreateFlags::NONE, gio::Cancellable::NONE) {
             Ok(_) => {
                 self.view.mark_saved();
+                self.refresh_git();
                 true
             }
             Err(e) => {

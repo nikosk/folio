@@ -2,6 +2,7 @@ mod app;
 mod doc;
 mod editor;
 mod files;
+mod git;
 mod headless;
 mod highlight;
 mod layout;

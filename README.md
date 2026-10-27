@@ -57,6 +57,12 @@ cargo build --release
     highlighted. Click a file to open it; the up arrow browses the parent
     folder. Hidden files show with `Ctrl+H` (as in Files/Nautilus); a hidden
     folder holding the open file always shows.
+  - **Git status** in a repository: **M** modified, **S** staged, **A** added,
+    **R** renamed, **N** new (untracked), **!** conflict; ignored files are
+    dimmed, and a folder shows a dot in the colour of the most important
+    change inside. It updates after `git add`/`commit`/`checkout`, after
+    saving, and when the window comes back to the front (git runs in the
+    background; without git there are no markings).
 - Go to file (`Ctrl+P`): type part of a name to fuzzy-search every Markdown
   file in that project; `↑`/`↓` and `Enter` open one.
 - Spell check (`F7` toggles it) through Enchant, with your system's
@@ -186,6 +192,7 @@ scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(
 | `src/view.rs` | GTK widget (`GtkScrollable`): scrolling, input, async image loading |
 | `src/app.rs` | Windows, actions, file loading, live reload, theme, saved settings |
 | `src/files.rs` | Files sidebar (lazy GTK tree of the project folder) and go to file (folder walk, fuzzy ranking) |
+| `src/git.rs` | Git status for the files sidebar (`git status --porcelain`, parsed) |
 | `src/spell.rs` | Spell checking: libenchant via `dlopen`, word splitting, per-word cache |
 | `src/update.sh` | `folio --update` (embedded in the binary) |
 | `src/paint.rs` | Drawing backends: GTK snapshot (GPU) and Cairo (headless) |

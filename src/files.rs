@@ -1,6 +1,7 @@
 //! The files sidebar (a lazily loaded tree of the document's folder) and
 //! quick open (`Ctrl+P`: fuzzy search over the Markdown files below it).
 
+use crate::git::{self, Mark};
 use gtk::glib::{self, clone};
 use gtk::{gdk, gio, prelude::*};
 use std::cell::RefCell;
@@ -186,8 +187,13 @@ pub struct FileTree {
     view: gtk::ListView,
     root: RefCell<Option<PathBuf>>,
     shown: Rc<Shown>,
-    /// Rows on screen and their paths, to mark the open file.
-    rows: RefCell<Vec<(glib::WeakRef<gtk::Widget>, PathBuf)>>,
+    /// Rows on screen, their paths and whether they are folders, to mark
+    /// the open file and git status.
+    rows: RefCell<Vec<(glib::WeakRef<gtk::Widget>, PathBuf, bool)>>,
+    git: RefCell<Option<Rc<git::Status>>>,
+    git_timer: RefCell<Option<glib::SourceId>>,
+    /// Watches the git index and HEAD (staging, commits, checkouts).
+    git_watch: RefCell<(PathBuf, Vec<gio::FileMonitor>)>,
     on_open: OpenHandler,
     on_root: Rc<dyn Fn(PathBuf)>,
     reveal_timer: RefCell<Option<glib::SourceId>>,
@@ -230,6 +236,9 @@ impl FileTree {
             root: RefCell::new(None),
             shown: Rc::default(),
             rows: RefCell::new(Vec::new()),
+            git: RefCell::new(None),
+            git_timer: RefCell::new(None),
+            git_watch: RefCell::new((PathBuf::new(), Vec::new())),
             on_open: Rc::new(on_open),
             on_root: Rc::new(on_root),
             reveal_timer: RefCell::new(None),
@@ -267,8 +276,11 @@ impl FileTree {
                 .build();
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             row.set_hexpand(true);
+            let badge = gtk::Label::new(None);
+            badge.add_css_class("git-badge");
             row.append(&icon);
             row.append(&label);
+            row.append(&badge);
             let exp = gtk::TreeExpander::new();
             exp.set_child(Some(&row));
             item.set_child(Some(&exp));
@@ -302,7 +314,7 @@ impl FileTree {
             if let Some(icon) = bx.first_child().and_downcast::<gtk::Image>() {
                 icon.set_icon_name(Some(if dir { "folder-symbolic" } else { "text-x-generic-symbolic" }));
             }
-            if let Some(label) = bx.last_child().and_downcast::<gtk::Label>() {
+            if let Some(label) = bx.first_child().and_then(|i| i.next_sibling()).and_downcast::<gtk::Label>() {
                 label.set_text(&info.display_name());
                 label.set_tooltip_text(Some(&info.display_name()));
             }
@@ -311,7 +323,8 @@ impl FileTree {
             if let Some(path) = info_file(&info).and_then(|f| f.path()) {
                 let current = t.shown.current.borrow().as_ref() == Some(&path);
                 set_class(&row_w, "current", current);
-                t.rows.borrow_mut().push((row_w.downgrade(), path));
+                t.apply_git(&row_w, &path, dir);
+                t.rows.borrow_mut().push((row_w.downgrade(), path, dir));
             } else {
                 set_class(&row_w, "current", false);
             }
@@ -320,7 +333,7 @@ impl FileTree {
         f.connect_unbind(move |_, item| {
             let Some(t) = weak.upgrade() else { return };
             let row_w = item.downcast_ref::<gtk::ListItem>().and_then(|i| i.child());
-            t.rows.borrow_mut().retain(|(w, _)| w.upgrade().is_some_and(|b| Some(&b) != row_w.as_ref()));
+            t.rows.borrow_mut().retain(|(w, _, _)| w.upgrade().is_some_and(|b| Some(&b) != row_w.as_ref()));
         });
         f
     }
@@ -335,7 +348,7 @@ impl FileTree {
     }
 
     /// Show `root` (no-op if it is already shown).
-    pub fn set_root(&self, root: &Path) {
+    pub fn set_root(self: &Rc<Self>, root: &Path) {
         if self.root.borrow().as_deref() == Some(root) {
             return;
         }
@@ -355,6 +368,8 @@ impl FileTree {
             Some(dir_model(&dir, &shown.upgrade()?))
         });
         self.view.set_model(Some(&gtk::NoSelection::new(Some(tree))));
+        self.git.take();
+        self.refresh_git();
     }
 
     /// Mark the open document's row, expanding the folders above it and
@@ -369,7 +384,7 @@ impl FileTree {
         if let Some(p) = path {
             self.reveal(p.to_path_buf());
         }
-        self.rows.borrow_mut().retain(|(w, p)| match w.upgrade() {
+        self.rows.borrow_mut().retain(|(w, p, _)| match w.upgrade() {
             Some(b) => {
                 set_class(&b, "current", Some(p.as_path()) == path);
                 true
@@ -425,6 +440,85 @@ impl FileTree {
 }
 
 impl FileTree {
+    /// Re-read git status (debounced; on a worker thread; only while shown).
+    pub fn refresh_git(self: &Rc<Self>) {
+        if let Some(id) = self.git_timer.take() {
+            id.remove();
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            let Some(t) = weak.upgrade() else { return };
+            t.git_timer.take();
+            let Some(root) = t.root.borrow().clone() else { return };
+            if !t.widget.is_mapped() {
+                return;
+            }
+            glib::MainContext::default().spawn_local(async move {
+                let r = root.clone();
+                let Ok(st) = gio::spawn_blocking(move || git::status(&r)).await else { return };
+                if t.root.borrow().as_ref() != Some(&root) {
+                    return;
+                }
+                if let Some(st) = &st {
+                    t.watch_git(&st.git_dir);
+                }
+                *t.git.borrow_mut() = st.map(Rc::new);
+                for (w, p, dir) in t.rows.borrow().iter() {
+                    if let Some(w) = w.upgrade() {
+                        t.apply_git(&w, p, *dir);
+                    }
+                }
+            });
+        });
+        *self.git_timer.borrow_mut() = Some(id);
+    }
+
+    fn watch_git(self: &Rc<Self>, git_dir: &Path) {
+        let mut watch = self.git_watch.borrow_mut();
+        if watch.0 == git_dir {
+            return;
+        }
+        watch.0 = git_dir.to_path_buf();
+        watch.1 = ["index", "HEAD"]
+            .iter()
+            .filter_map(|f| gio::File::for_path(git_dir.join(f)).monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE).ok())
+            .collect();
+        for m in &watch.1 {
+            let weak = Rc::downgrade(self);
+            m.connect_changed(move |_, _, _, _| {
+                if let Some(t) = weak.upgrade() {
+                    t.refresh_git();
+                }
+            });
+        }
+    }
+
+    /// Badge (and dimming for ignored files) on one row.
+    fn apply_git(&self, row: &gtk::Widget, path: &Path, dir: bool) {
+        let mark = self.git.borrow().as_ref().and_then(|g| g.mark(path, dir));
+        let badge = row.downcast_ref::<gtk::TreeExpander>().and_then(|e| e.child()).and_then(|b| b.last_child());
+        let Some(badge) = badge.and_downcast::<gtk::Label>() else {
+            return;
+        };
+        for c in ["git-new", "git-staged", "git-modified", "git-conflict", "git-ignored"] {
+            badge.remove_css_class(c);
+        }
+        set_class(row, "git-ignored", mark == Some(Mark::Ignored));
+        match mark.filter(|&m| m != Mark::Ignored) {
+            Some(m) => {
+                let (letter, class, tip) = m.badge();
+                // A folder gets a dot for what is inside, unless it is new itself.
+                let own = !dir || self.git.borrow().as_ref().is_some_and(|g| g.mark(path, false).is_some());
+                badge.set_text(if own { letter } else { "●" });
+                badge.add_css_class(class);
+                badge.set_tooltip_text(Some(if own { tip } else { "Contains changes" }));
+                set_class(&badge, "dot", !own);
+                badge.set_visible(true);
+            }
+            None => badge.set_visible(false),
+        }
+    }
+
     pub fn set_show_hidden(&self, on: bool) {
         if self.shown.hidden.replace(on) != on {
             self.shown.changed();

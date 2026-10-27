@@ -91,6 +91,15 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   whose hidden ancestors always pass) and is told to refilter when either
   changes. Like Nautilus, the tree hides only dot-files, not
   `node_modules`/`target`.
+- **Git markings** (`git.rs`): `git rev-parse` + `git status --porcelain=v1
+  -z --ignored` on `gio::spawn_blocking` (~60 ms on this repo), parsed into
+  per-file marks, whole untracked/ignored folders, and the strongest mark
+  per folder. `FileTree::refresh_git` is debounced (150 ms), only runs while
+  the tree is mapped, and restyles the rows on screen. Triggers: the files
+  page shown, `.git/index` and `HEAD` changing (monitored), our saves,
+  reloads, and the window becoming active. Not caught: another program
+  editing a file while Folio stays in front (watching every file costs
+  more than it is worth so far).
 - **Go to file** (`files::QuickOpen`): an overlay over the window. Each
   `Ctrl+P` walks the folder again on `gio::spawn_blocking` (hidden files
   only with `Ctrl+H`; never `.git`, `node_modules`, `target`; capped at
@@ -124,6 +133,8 @@ are in `docs/ROADMAP.md`):
 6. Spell check uses the locale's language only; a language menu (Enchant
    lists the installed dictionaries) would help multilingual users.
 7. The files tree has no file operations (new, rename, delete).
+8. Git markings don't update while another program edits files and Folio
+   stays in the foreground (see "Git markings").
 
 ## Architecture
 

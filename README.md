@@ -55,14 +55,15 @@ cargo build --release
   - **Files:** the document's project (its git work tree, or else its
     folder) as a tree of folders and Markdown files, with the open file
     highlighted. Click a file to open it; the up arrow browses the parent
-    folder.
+    folder. Hidden files show with `Ctrl+H` (as in Files/Nautilus); a hidden
+    folder holding the open file always shows.
 - Go to file (`Ctrl+P`): type part of a name to fuzzy-search every Markdown
   file in that project; `↑`/`↓` and `Enter` open one.
 - Spell check (`F7` toggles it) through Enchant, with your system's
   Hunspell/Aspell dictionaries for your language. Code, links, math, paths
   and acronyms are skipped. Right-click a marked word for suggestions,
   "Add to Dictionary" or "Ignore". Without libenchant it is simply off.
-- Spell checking and the sidebar's state are remembered in
+- Spell checking, hidden files and the sidebar's state are remembered in
   `~/.config/folio/settings`.
 - Input goes through the GTK input method, so IME, compose and dead keys work.
 - The header menu (left) opens files, copies the current file's path, shows
@@ -103,6 +104,7 @@ cargo build --release
 | Sidebar (outline, files) | `F9` |
 | Go to file | `Ctrl+P` |
 | Spell check on/off | `F7` |
+| Show hidden files (sidebar, go to file) | `Ctrl+H` |
 | Copy file path | `Ctrl+Alt+C` |
 | Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
 | Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |

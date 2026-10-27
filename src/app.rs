@@ -51,6 +51,8 @@ struct State {
     sidebar: Cell<bool>,
     side_page: RefCell<String>,
     spell: Cell<bool>,
+    /// Show hidden files in the files sidebar and go to file.
+    hidden: Cell<bool>,
     css: gtk::CssProvider,
     windows: RefCell<Vec<Weak<Win>>>,
     gsettings: RefCell<Option<gio::Settings>>,
@@ -84,7 +86,13 @@ fn load_settings() -> Vec<(String, String)> {
 
 fn save_settings() {
     let st = state();
-    let text = format!("spell={}\nsidebar={}\nside_page={}\n", st.spell.get(), st.sidebar.get(), st.side_page.borrow());
+    let text = format!(
+        "spell={}\nsidebar={}\nside_page={}\nshow_hidden={}\n",
+        st.spell.get(),
+        st.sidebar.get(),
+        st.side_page.borrow(),
+        st.hidden.get()
+    );
     if let Some(f) = settings_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap_or(&f)).and_then(|_| std::fs::write(&f, text));
     }
@@ -151,6 +159,7 @@ fn startup(app: &gtk::Application) {
         sidebar: Cell::new(get("sidebar") == Some("true")),
         side_page: RefCell::new(get("side_page").filter(|p| *p == "files").unwrap_or("outline").into()),
         spell: Cell::new(get("spell") != Some("false")),
+        hidden: Cell::new(get("show_hidden") == Some("true")),
         css,
         windows: RefCell::new(Vec::new()),
         gsettings: RefCell::new(settings),
@@ -190,11 +199,23 @@ fn startup(app: &gtk::Application) {
         }
     });
     app.add_action(&spell);
+    let hidden = gio::SimpleAction::new_stateful("show-hidden", None, &state().hidden.get().to_variant());
+    hidden.connect_activate(|a, _| {
+        let on = !state().hidden.get();
+        state().hidden.set(on);
+        save_settings();
+        a.set_state(&on.to_variant());
+        for w in state().windows.borrow().iter().filter_map(Weak::upgrade) {
+            w.files.set_show_hidden(on);
+        }
+    });
+    app.add_action(&hidden);
 
     for (action, accels) in [
         ("app.quit", &["<Ctrl>q"][..]),
         ("app.toggle-theme", &["<Ctrl>d"]),
         ("app.spell", &["F7"]),
+        ("app.show-hidden", &["<Ctrl>h"]),
         ("win.sidebar", &["F9"]),
         ("win.quick-open", &["<Ctrl>p"]),
         ("app.new", &["<Ctrl>n"]),
@@ -273,6 +294,7 @@ impl Win {
         file_menu.append_section(None, &this_file);
         let options = gio::Menu::new();
         options.append(Some("Check Spelling"), Some("app.spell"));
+        options.append(Some("Show Hidden Files"), Some("app.show-hidden"));
         file_menu.append_section(None, &options);
         let menu_btn = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -417,6 +439,7 @@ impl Win {
             outline: RefCell::new(Vec::new()),
         });
         w.side_stack.add_titled(&w.files.widget, Some("files"), "Files");
+        w.files.set_show_hidden(state().hidden.get());
         overlay.add_overlay(&w.quick.widget);
         state().windows.borrow_mut().push(Rc::downgrade(&w));
         w.setup_actions();
@@ -474,7 +497,7 @@ impl Win {
                 w.side_btn.set_active(true);
             }
             if let Ok(q) = std::env::var("FOLIO_QUICK") {
-                w.quick.show(w.root.borrow().clone());
+                w.quick.show(w.root.borrow().clone(), state().hidden.get());
                 w.quick.entry.set_text(&q);
             }
             glib::timeout_add_local_once(Duration::from_millis(400), move || {
@@ -531,7 +554,7 @@ impl Win {
             if w.quick.is_open() {
                 w.quick.hide();
             } else {
-                w.quick.show(w.root.borrow().clone());
+                w.quick.show(w.root.borrow().clone(), state().hidden.get());
             }
         });
         self.action("back", |w| {

@@ -86,10 +86,15 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   (`files::FileTree`), both refreshed only while shown. The tree is a
   `TreeListModel` over `DirectoryList`s (folders load when expanded and are
   watched by GTK); `set_current` expands down to the open file a level per
-  30 ms tick, since folders load asynchronously.
+  30 ms tick, since folders load asynchronously. Every folder's
+  `CustomFilter` reads one shared `Shown` (show hidden; the open file,
+  whose hidden ancestors always pass) and is told to refilter when either
+  changes. Like Nautilus, the tree hides only dot-files, not
+  `node_modules`/`target`.
 - **Go to file** (`files::QuickOpen`): an overlay over the window. Each
-  `Ctrl+P` walks the folder again on `gio::spawn_blocking` (skipping hidden
-  folders, `node_modules`, `target`; capped at 50,000 entries) and ranks
+  `Ctrl+P` walks the folder again on `gio::spawn_blocking` (hidden files
+  only with `Ctrl+H`; never `.git`, `node_modules`, `target`; capped at
+  50,000 entries) and ranks
   with `files::score` (subsequence match; file name, word starts and runs
   score higher; the extension scores nothing).
 - **Spell check** (`spell.rs`): `Engine::typos(i)` runs in `ensure_block`
@@ -100,7 +105,7 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   `spell::words`, which skips code-like tokens; spans with code, link, math
   or syntax styles are skipped too.
 - **Settings:** `~/.config/folio/settings` (`key=value`: spell, sidebar,
-  side_page), read at startup and written when they change.
+  side_page, show_hidden), read at startup and written when they change.
 
 Next steps for existing features, roughly in priority order (new features
 are in `docs/ROADMAP.md`):
@@ -209,12 +214,15 @@ The agent's shell has no display. What works:
   focuses the window, so start with a throwaway click; and don't set
   `XDG_CONFIG_HOME` for the app (the window then stays unfocused and gets
   no input). The app writes `~/.config/folio/settings`; tests that toggle
-  the sidebar change it.
+  the sidebar change it, so back up the user's file first and put it back
+  afterwards.
 - GTK 4.14 pitfalls met while building the sidebar: CSS `:has()` is not
   supported; adding CSS classes to a `ListView`'s row widget (the list
   item's parent) leaves rows empty, so style the item's child; `hexpand`
   on any child propagates up and made the sidebar take half the window
-  (it now sets `hexpand(false)`); a widget can only `grab_focus` once
+  (it now sets `hexpand(false)`); an ellipsized label still asks for its
+  full text width, so long names widened the sidebar until the labels got
+  `max_width_chars`; a widget can only `grab_focus` once
   mapped (go to file focuses its entry in `connect_map`).
   `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this
   harness is software-rendered, so GPU startup numbers are pessimistic.

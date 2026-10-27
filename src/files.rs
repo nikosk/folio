@@ -14,9 +14,10 @@ pub fn is_markdown(p: &Path) -> bool {
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd" | "mdx" | "txt"))
 }
 
-/// Folders never shown or searched: hidden ones and build/dependency output.
+/// Folders go to file never searches: repository internals and
+/// build/dependency output (the tree still shows them).
 fn skip_dir(name: &str) -> bool {
-    name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
+    matches!(name, ".git" | "node_modules" | "target" | "__pycache__")
 }
 
 /// The folder to browse for a document in `dir`: its git work tree if it is
@@ -36,7 +37,8 @@ pub fn project_root(dir: &Path) -> PathBuf {
 
 /// Markdown files below `root` (relative paths), breadth first, giving up
 /// after `limit` directory entries so a huge folder can't stall the search.
-pub fn walk(root: &Path, limit: usize) -> Vec<PathBuf> {
+/// Hidden files and folders are included only with `hidden`.
+pub fn walk(root: &Path, limit: usize, hidden: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([PathBuf::new()]);
     let mut seen = 0;
@@ -53,11 +55,14 @@ pub fn walk(root: &Path, limit: usize) -> Vec<PathBuf> {
             let Some(n) = name.to_str() else { continue };
             let Ok(ft) = e.file_type() else { continue };
             let path = rel.join(n);
+            if !hidden && n.starts_with('.') {
+                continue;
+            }
             if ft.is_dir() {
                 if !skip_dir(n) {
                     queue.push_back(path);
                 }
-            } else if !n.starts_with('.') && is_markdown(&path) {
+            } else if is_markdown(&path) {
                 out.push(path);
             }
         }
@@ -123,21 +128,44 @@ fn info_file(info: &gio::FileInfo) -> Option<gio::File> {
     info.attribute_object("standard::file").and_downcast()
 }
 
-/// Folders first, then Markdown files, hidden things and others left out.
-fn dir_model(dir: &gio::File) -> gio::ListModel {
+/// What the tree shows, shared by the filters of all its folders.
+#[derive(Default)]
+struct Shown {
+    hidden: std::cell::Cell<bool>,
+    /// The open file: it and the folders above it show even when hidden.
+    current: RefCell<Option<PathBuf>>,
+    filters: RefCell<Vec<glib::WeakRef<gtk::CustomFilter>>>,
+}
+
+impl Shown {
+    fn changed(&self) {
+        self.filters.borrow_mut().retain(|f| match f.upgrade() {
+            Some(f) => {
+                f.changed(gtk::FilterChange::Different);
+                true
+            }
+            None => false,
+        });
+    }
+}
+
+/// Folders first, then Markdown files; hidden ones only when asked for, or
+/// on the way to the open file.
+fn dir_model(dir: &gio::File, shown: &Rc<Shown>) -> gio::ListModel {
     let list = gtk::DirectoryList::new(Some(ATTRS), Some(dir));
-    let filter = gtk::CustomFilter::new(|o| {
-        let Some(info) = o.downcast_ref::<gio::FileInfo>() else { return false };
-        let name = info.name();
-        let Some(n) = name.to_str() else { return false };
-        if info.is_hidden() || n.starts_with('.') {
+    let sh = Rc::downgrade(shown);
+    let filter = gtk::CustomFilter::new(move |o| {
+        let (Some(info), Some(sh)) = (o.downcast_ref::<gio::FileInfo>(), sh.upgrade()) else { return false };
+        let dir = info.file_type() == gio::FileType::Directory;
+        if !dir && !is_markdown(&info.name()) {
             return false;
         }
-        match info.file_type() {
-            gio::FileType::Directory => !skip_dir(n),
-            _ => is_markdown(&name),
-        }
+        let hidden = info.is_hidden() || info.name().to_str().is_some_and(|n| n.starts_with('.'));
+        sh.hidden.get()
+            || !hidden
+            || sh.current.borrow().as_ref().is_some_and(|c| info_file(info).and_then(|f| f.path()).is_some_and(|p| c.starts_with(p)))
     });
+    shown.filters.borrow_mut().push(filter.downgrade());
     let sorter = gtk::CustomSorter::new(|a, b| {
         let (Some(a), Some(b)) = (a.downcast_ref::<gio::FileInfo>(), b.downcast_ref::<gio::FileInfo>()) else {
             return gtk::Ordering::Equal;
@@ -157,7 +185,7 @@ pub struct FileTree {
     title: gtk::Label,
     view: gtk::ListView,
     root: RefCell<Option<PathBuf>>,
-    current: RefCell<Option<PathBuf>>,
+    shown: Rc<Shown>,
     /// Rows on screen and their paths, to mark the open file.
     rows: RefCell<Vec<(glib::WeakRef<gtk::Widget>, PathBuf)>>,
     on_open: OpenHandler,
@@ -169,7 +197,14 @@ impl FileTree {
     /// `on_open` gets a Markdown file the user clicked; `on_root` the new
     /// root after going up a folder.
     pub fn new(on_open: impl Fn(PathBuf) + 'static, on_root: impl Fn(PathBuf) + 'static) -> Rc<FileTree> {
-        let title = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::Start).build();
+        // Ellipsized labels still ask for their whole text's width;
+        // `max_width_chars` stops long names from widening the sidebar.
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .max_width_chars(1)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .build();
         title.add_css_class("files-root");
         let up = gtk::Button::from_icon_name("go-up-symbolic");
         up.set_tooltip_text(Some("Parent folder"));
@@ -193,7 +228,7 @@ impl FileTree {
             title,
             view,
             root: RefCell::new(None),
-            current: RefCell::new(None),
+            shown: Rc::default(),
             rows: RefCell::new(Vec::new()),
             on_open: Rc::new(on_open),
             on_root: Rc::new(on_root),
@@ -224,7 +259,12 @@ impl FileTree {
         f.connect_setup(move |_, item| {
             let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
             let icon = gtk::Image::new();
-            let label = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+            let label = gtk::Label::builder()
+                .xalign(0.0)
+                .hexpand(true)
+                .max_width_chars(1)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             row.set_hexpand(true);
             row.append(&icon);
@@ -269,7 +309,7 @@ impl FileTree {
             // The expander fills the row, so the highlight spans the indentation.
             let row_w: gtk::Widget = exp.clone().upcast();
             if let Some(path) = info_file(&info).and_then(|f| f.path()) {
-                let current = t.current.borrow().as_ref() == Some(&path);
+                let current = t.shown.current.borrow().as_ref() == Some(&path);
                 set_class(&row_w, "current", current);
                 t.rows.borrow_mut().push((row_w.downgrade(), path));
             } else {
@@ -307,10 +347,12 @@ impl FileTree {
         self.title.set_text(&name);
         self.title.set_tooltip_text(Some(&root.display().to_string()));
         self.rows.borrow_mut().clear();
-        let tree = gtk::TreeListModel::new(dir_model(&gio::File::for_path(root)), false, false, |o| {
+        self.shown.filters.borrow_mut().clear();
+        let shown = Rc::downgrade(&self.shown);
+        let tree = gtk::TreeListModel::new(dir_model(&gio::File::for_path(root), &self.shown), false, false, move |o| {
             let info = o.downcast_ref::<gio::FileInfo>()?;
             let dir = info_file(info).filter(|_| info.file_type() == gio::FileType::Directory)?;
-            Some(dir_model(&dir))
+            Some(dir_model(&dir, &shown.upgrade()?))
         });
         self.view.set_model(Some(&gtk::NoSelection::new(Some(tree))));
     }
@@ -318,10 +360,15 @@ impl FileTree {
     /// Mark the open document's row, expanding the folders above it and
     /// scrolling to it.
     pub fn set_current(self: &Rc<Self>, path: Option<&Path>) {
+        let new = path.map(Path::to_path_buf);
+        if *self.shown.current.borrow() != new {
+            *self.shown.current.borrow_mut() = new;
+            // A hidden folder on the way to the file may now show.
+            self.shown.changed();
+        }
         if let Some(p) = path {
             self.reveal(p.to_path_buf());
         }
-        *self.current.borrow_mut() = path.map(Path::to_path_buf);
         self.rows.borrow_mut().retain(|(w, p)| match w.upgrade() {
             Some(b) => {
                 set_class(&b, "current", Some(p.as_path()) == path);
@@ -374,6 +421,14 @@ impl FileTree {
             }
         }
         false
+    }
+}
+
+impl FileTree {
+    pub fn set_show_hidden(&self, on: bool) {
+        if self.shown.hidden.replace(on) != on {
+            self.shown.changed();
+        }
     }
 }
 
@@ -521,7 +576,7 @@ impl QuickOpen {
     }
 
     /// Show it, listing the files below `root`.
-    pub fn show(self: &Rc<Self>, root: Option<PathBuf>) {
+    pub fn show(self: &Rc<Self>, root: Option<PathBuf>, hidden: bool) {
         self.entry.set_text("");
         // Focus moves to the entry once it is mapped (see `setup`).
         self.widget.set_visible(true);
@@ -536,7 +591,7 @@ impl QuickOpen {
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
             let r = root.clone();
-            let Ok(files) = gio::spawn_blocking(move || walk(&r, WALK_LIMIT)).await else { return };
+            let Ok(files) = gio::spawn_blocking(move || walk(&r, WALK_LIMIT, hidden)).await else { return };
             let Some(q) = weak.upgrade() else { return };
             if q.root.borrow().as_ref() != Some(&root) {
                 return;
@@ -580,9 +635,15 @@ impl QuickOpen {
                 None => ("", f.as_str()),
             };
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            let n = gtk::Label::builder().label(name).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+            let n = gtk::Label::builder().label(name).xalign(0.0).max_width_chars(40).ellipsize(gtk::pango::EllipsizeMode::End).build();
             n.add_css_class("name");
-            let d = gtk::Label::builder().label(dir).xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::Start).build();
+            let d = gtk::Label::builder()
+                .label(dir)
+                .xalign(0.0)
+                .hexpand(true)
+                .max_width_chars(1)
+                .ellipsize(gtk::pango::EllipsizeMode::Start)
+                .build();
             d.add_css_class("dim");
             row.append(&n);
             row.append(&d);
@@ -623,15 +684,20 @@ mod tests {
     #[test]
     fn walk_finds_markdown_and_skips_hidden() {
         let dir = std::env::temp_dir().join(format!("folio-walk-{}", std::process::id()));
-        for d in ["a/b", ".git", "node_modules/x"] {
+        for d in ["a/b", ".git", "node_modules/x", ".notes"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
-        for f in ["top.md", "a/b/deep.markdown", "a/code.rs", ".git/x.md", "node_modules/x/y.md", ".hidden.md"] {
+        for f in ["top.md", "a/b/deep.markdown", "a/code.rs", ".git/x.md", "node_modules/x/y.md", ".hidden.md", ".notes/n.md"] {
             std::fs::write(dir.join(f), "").unwrap();
         }
-        let mut got = walk(&dir, 1000);
-        got.sort();
-        assert_eq!(got, [PathBuf::from("a/b/deep.markdown"), PathBuf::from("top.md")]);
+        let sorted = |mut v: Vec<PathBuf>| {
+            v.sort();
+            v
+        };
+        let p = PathBuf::from;
+        assert_eq!(sorted(walk(&dir, 1000, false)), [p("a/b/deep.markdown"), p("top.md")]);
+        // Hidden ones on request; repository internals never.
+        assert_eq!(sorted(walk(&dir, 1000, true)), [p(".hidden.md"), p(".notes/n.md"), p("a/b/deep.markdown"), p("top.md")]);
         assert_eq!(project_root(&dir.join("a/b")), dir);
         std::fs::remove_dir_all(&dir).unwrap();
     }

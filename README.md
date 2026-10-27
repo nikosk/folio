@@ -49,8 +49,21 @@ cargo build --release
 - Paste or drop files to link them (images inline, paths relative to the
   document); a pasted image is saved as `images/pasted-<time>.png` next to
   the document.
-- Outline sidebar (`F9` or the header button): headings with the current
-  section highlighted; click one to jump to it.
+- Sidebar (`F9` or the header button) with two pages:
+  - **Outline:** headings with the current section highlighted; click one
+    to jump to it.
+  - **Files:** the document's project (its git work tree, or else its
+    folder) as a tree of folders and Markdown files, with the open file
+    highlighted. Click a file to open it; the up arrow browses the parent
+    folder.
+- Go to file (`Ctrl+P`): type part of a name to fuzzy-search every Markdown
+  file in that project; `↑`/`↓` and `Enter` open one.
+- Spell check (`F7` toggles it) through Enchant, with your system's
+  Hunspell/Aspell dictionaries for your language. Code, links, math, paths
+  and acronyms are skipped. Right-click a marked word for suggestions,
+  "Add to Dictionary" or "Ignore". Without libenchant it is simply off.
+- Spell checking and the sidebar's state are remembered in
+  `~/.config/folio/settings`.
 - Input goes through the GTK input method, so IME, compose and dead keys work.
 - The header menu (left) opens files, copies the current file's path, shows
   it in the file manager, or opens it in another app (the system's "Open
@@ -87,7 +100,9 @@ cargo build --release
 | Indent / outdent list item | `Tab` / `Shift+Tab` |
 | Table: next / previous cell, row below | `Tab` / `Shift+Tab`, `Enter`; `Ctrl+Enter` inserts a row |
 | Insert table | `Ctrl+T` |
-| Outline sidebar | `F9` |
+| Sidebar (outline, files) | `F9` |
+| Go to file | `Ctrl+P` |
+| Spell check on/off | `F7` |
 | Copy file path | `Ctrl+Alt+C` |
 | Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
 | Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |
@@ -117,6 +132,9 @@ cargo build --release
   one paragraph; unchanged neighbours keep their layout. Edits that can
   affect the whole document (code fences that lose their end, footnotes,
   link definitions) fall back to a full re-parse, which is still ~5 ms.
+- **Spell checking stays off the critical path.** libenchant is opened at
+  run time on a worker thread (no link-time dependency), only blocks laid
+  out for display are checked, and results are cached per word.
 - **Single instance.** A second `folio file.md` hands the file to the running
   process over D-Bus and opens a new window there.
 
@@ -132,6 +150,8 @@ pessimistic), 750 KB / 2,700-block file:
 | Keystroke: edit + re-parse + layout (typing into a paragraph) | 0.42 ms median, 1.7 ms max |
 | Keystroke: Enter / undo | 0.07 ms / 0.06 ms median |
 | Keystroke in a 7-row table cell (the table is re-laid out) | 0.42 ms median, 0.7 ms max |
+| Spell check: load the dictionary (worker thread) / check one screen, no words cached | 3–4 ms / 1.5–2 ms |
+| Scroll step with spell check | 0.9 ms median, 2.7–3.5 ms max |
 | Cold start → first frame, Cairo renderer | ~135–150 ms, 59 MB RSS |
 | Cold start → first frame, GL renderer | ~300–400 ms (dominated by GL init) |
 
@@ -147,11 +167,11 @@ but draws every frame on the CPU. Try it with `GSK_RENDERER=cairo folio FILE`.
 
 ```sh
 cargo test
-folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--select-all] [--caret OFFSET] FILE
+folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--select-all] [--caret OFFSET] [--spell] FILE
 folio --bench FILE                     # engine and typing timings, no display needed
 python3 samples/gen_big.py             # generate samples/big.md for benchmarking
 FOLIO_STARTUP=1 folio FILE             # print startup phase timings, exit after first frame
-FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND)
+FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND, FOLIO_SIDEBAR, FOLIO_QUICK)
 scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE   # no display needed
 scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(300, 400)" "type('hi')"   # scripted input
 ```
@@ -162,7 +182,9 @@ scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(
 | `src/editor.rs` | Editing: caret and selection as source offsets, the source view of the active block, incremental re-parse, undo |
 | `src/layout.rs` | Layout engine: lazy per-block Pango layout, virtual heights, painting, hit-testing, selection, find |
 | `src/view.rs` | GTK widget (`GtkScrollable`): scrolling, input, async image loading |
-| `src/app.rs` | Windows, actions, file loading, live reload, theme |
+| `src/app.rs` | Windows, actions, file loading, live reload, theme, saved settings |
+| `src/files.rs` | Files sidebar (lazy GTK tree of the project folder) and go to file (folder walk, fuzzy ranking) |
+| `src/spell.rs` | Spell checking: libenchant via `dlopen`, word splitting, per-word cache |
 | `src/update.sh` | `folio --update` (embedded in the binary) |
 | `src/paint.rs` | Drawing backends: GTK snapshot (GPU) and Cairo (headless) |
 | `src/highlight.rs`, `src/tex.rs` | Code highlighting, TeX → Unicode |

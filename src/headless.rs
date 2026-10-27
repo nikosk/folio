@@ -1,4 +1,4 @@
-//! `folio --render out.png [--width W] [--height H] [--scroll Y] [--zoom Z] [--dark] [--caret OFFSET] FILE`
+//! `folio --render out.png [--width W] [--height H] [--scroll Y] [--zoom Z] [--dark] [--caret OFFSET] [--spell] FILE`
 //! `folio --bench FILE`
 //!
 //! Renders without a display (Cairo instead of GTK) for tests, screenshots
@@ -18,7 +18,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut out = None;
     let (mut w, mut h, mut scroll, mut zoom) = (1000.0, 1300.0, 0.0, 1.0);
     let (mut dark, mut bench, mut select, mut file) = (false, false, false, None);
-    let mut caret = None;
+    let (mut caret, mut spell) = (None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut num = || it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -32,6 +32,7 @@ pub fn run(args: &[String]) -> ExitCode {
             "--bench" => bench = true,
             "--select-all" => select = true,
             "--caret" => caret = Some(num() as usize),
+            "--spell" => spell = true,
             f => file = Some(f.to_string()),
         }
     }
@@ -117,6 +118,36 @@ pub fn run(args: &[String]) -> ExitCode {
             );
         }
         println!("full re-parses during typing: {}", e.ed.full_parses);
+        let t = Instant::now();
+        load_spell();
+        println!("spell: dictionary loaded in {:.1} ms (worker thread)", ms(t.elapsed()));
+        if crate::spell::ready() {
+            e.spell = true;
+            e.clear_caret();
+            e.ensure(0.0, h);
+            let t = Instant::now();
+            e.recheck_spelling();
+            println!("spell: first screen {:.2} ms (no words cached)", ms(t.elapsed()));
+            let mut frames = Vec::new();
+            let mut y = 0.0;
+            while y < total {
+                let t = Instant::now();
+                e.ensure(y, y + h);
+                frames.push(t.elapsed());
+                y += h * 0.5;
+            }
+            frames.sort();
+            println!(
+                "scroll step with spell check: median {:.3} ms, max {:.3} ms over {} steps",
+                ms(frames[frames.len() / 2]),
+                ms(*frames.last().unwrap()),
+                frames.len()
+            );
+            for (what, mut v) in bench_typing(&mut e, h) {
+                v.sort();
+                println!("{what:<13} median {:.3} ms, max {:.3} ms with spell check", ms(v[v.len() / 2]), ms(*v.last().unwrap()));
+            }
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -131,6 +162,11 @@ pub fn run(args: &[String]) -> ExitCode {
             let img = gdk::Texture::from_filename(&p).map_or(Img::Failed, Img::Ready);
             e.image_ready(&p, img);
         }
+    }
+    if spell {
+        load_spell();
+        e.spell = true;
+        e.recheck_spelling();
     }
     if select {
         e.select_all();
@@ -151,6 +187,13 @@ pub fn run(args: &[String]) -> ExitCode {
     surf.write_to_png(&mut f).expect("write png");
     println!("wrote {out} (doc height {:.0}px)", e.total_height());
     ExitCode::SUCCESS
+}
+
+fn load_spell() {
+    crate::spell::start();
+    while !crate::spell::loaded() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Type into a paragraph in the middle of the document, as a user would:

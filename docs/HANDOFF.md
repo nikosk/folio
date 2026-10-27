@@ -24,6 +24,8 @@ doesn't say.
 | **GPU renderer (GTK default)** | Decided after measuring. In headless tests the Cairo renderer reached first frame in ~140 ms vs ~300–400 ms on GL, but it rasterises every frame on the CPU (8–13 ms per frame at 1000–2000 px), which risks stutter on large or HiDPI screens. Don't force `GSK_RENDERER`. |
 | Single-instance GApplication | A second launch hands the file to the running process over D-Bus. |
 | Remote images not fetched | No network code. Remote images render as link chips. |
+| Spell check through libenchant, opened with `dlopen` | Enchant is what GNOME apps use (Hunspell/Nuspell/Aspell dictionaries, shared personal word list in `~/.config/enchant`). `dlopen` on a worker thread keeps it out of the build (no `-dev` package, no crate) and off the startup path; without the library spell check is just unavailable. Measured: 3–4 ms to load, 1.5–2 ms to check a screen with an empty cache. |
+| Files sidebar and go to file show the git work tree | The project is usually what you want to browse (`docs/HANDOFF.md` → the repo); outside a repo it is the document's folder, and the home folder itself never counts as a project. Opening a file inside the shown folder keeps it. |
 | `folio --update` is a shell script | Keeps network code out of the binary: `src/update.sh` (embedded with `include_str!`) uses curl or wget, checks the release's `.sha256` and runs the release's `install.sh`, which installs to `~/.local/bin`. It depends on the release asset names in `release.yml`. No update check at startup (startup speed, no network). |
 
 ## v2 status
@@ -80,6 +82,25 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   one undo step, caret mapped through them).
 - **Outline:** `Engine::outline` / `heading_at`; the window keeps a `ListBox`
   in a `Revealer` and rebuilds rows only when heading text changes.
+- **Sidebar** (`app.rs`): a `Stack` with the outline and the files page
+  (`files::FileTree`), both refreshed only while shown. The tree is a
+  `TreeListModel` over `DirectoryList`s (folders load when expanded and are
+  watched by GTK); `set_current` expands down to the open file a level per
+  30 ms tick, since folders load asynchronously.
+- **Go to file** (`files::QuickOpen`): an overlay over the window. Each
+  `Ctrl+P` walks the folder again on `gio::spawn_blocking` (skipping hidden
+  folders, `node_modules`, `target`; capped at 50,000 entries) and ranks
+  with `files::score` (subsequence match; file name, word starts and runs
+  score higher; the extension scores nothing).
+- **Spell check** (`spell.rs`): `Engine::typos(i)` runs in `ensure_block`
+  (blocks laid out for display only, not `measure_some`) and stores
+  `(part, start, end)` in `Laid`; `paint_block` draws the wave and skips the
+  word whose end the caret is at (the word being typed). `typo_at` maps a
+  click back to a source range for the right-click menu. Words come from
+  `spell::words`, which skips code-like tokens; spans with code, link, math
+  or syntax styles are skipped too.
+- **Settings:** `~/.config/folio/settings` (`key=value`: spell, sidebar,
+  side_page), read at startup and written when they change.
 
 Next steps for existing features, roughly in priority order (new features
 are in `docs/ROADMAP.md`):
@@ -94,7 +115,10 @@ are in `docs/ROADMAP.md`):
 4. The source view of a heading or paragraph appears instantly on click and
    can shift text horizontally (syntax becomes visible); consider a short
    transition or keeping the click point fixed.
-5. Rich-text copy (HTML) alongside Markdown (planned for 0.7 in the roadmap).
+5. Rich-text copy (HTML) alongside Markdown (planned for 0.8 in the roadmap).
+6. Spell check uses the locale's language only; a language menu (Enchant
+   lists the installed dictionaries) would help multilingual users.
+7. The files tree has no file operations (new, rename, delete).
 
 ## Architecture
 
@@ -177,7 +201,21 @@ The agent's shell has no display. What works:
   hot corner; and window placement varies between runs, so a click can miss
   (retry). Popovers are separate surfaces and don't appear in screenshots.
 - `folio --render out.png --caret OFFSET FILE` renders with the source view of
-  the block at OFFSET.
+  the block at OFFSET; `--spell` adds spell checking.
+- `FOLIO_SIDEBAR=files` and `FOLIO_QUICK=text` script the sidebar and go to
+  file in `FOLIO_SCREENSHOT` runs. Popovers (the right-click spelling menu)
+  can't be screenshotted; `editor::tests::spelling_correction` covers it.
+- More `drive.py` quirks: the first click into a fresh session often only
+  focuses the window, so start with a throwaway click; and don't set
+  `XDG_CONFIG_HOME` for the app (the window then stays unfocused and gets
+  no input). The app writes `~/.config/folio/settings`; tests that toggle
+  the sidebar change it.
+- GTK 4.14 pitfalls met while building the sidebar: CSS `:has()` is not
+  supported; adding CSS classes to a `ListView`'s row widget (the list
+  item's parent) leaves rows empty, so style the item's child; `hexpand`
+  on any child propagates up and made the sidebar take half the window
+  (it now sets `hexpand(false)`); a widget can only `grab_focus` once
+  mapped (go to file focuses its entry in `connect_map`).
   `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this
   harness is software-rendered, so GPU startup numbers are pessimistic.
 - Dead ends, don't retry: GTK's Broadway backend plus headless Chromium (new

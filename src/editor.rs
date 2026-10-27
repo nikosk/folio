@@ -863,6 +863,11 @@ impl Engine {
         self.edit_sel(r, &text, None, Some((at, at)));
     }
 
+    /// Replace a source range (a spelling correction), as one undo step.
+    pub fn replace(&mut self, r: Range<usize>, text: &str) {
+        self.edit(r, text, None);
+    }
+
     /// Typed or pasted text replaces the selection.
     pub fn insert(&mut self, text: &str) {
         let Some(r) = self.sel_or_caret() else { return };
@@ -1507,6 +1512,31 @@ mod tests {
             check(&e);
         }
         e
+    }
+
+    /// Right-click on a misspelled word, pick a suggestion (needs a system
+    /// dictionary; skipped without one).
+    #[test]
+    fn spelling_correction() {
+        crate::spell::start();
+        while !crate::spell::loaded() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !crate::spell::ready() {
+            return;
+        }
+        let mut e = engine("# Title\n\nThe wrold is `wrold` here.\n");
+        e.spell = true;
+        e.set_caret(19, false, true);
+        e.ensure(0.0, 600.0);
+        assert_eq!(e.typo_at(15), Some(13..18));
+        assert_eq!(e.typo_at(23), None, "code is not checked");
+        e.replace(13..18, "world");
+        assert_eq!(e.src, "# Title\n\nThe world is `wrold` here.\n");
+        e.ensure(0.0, 600.0);
+        assert_eq!(e.typo_at(15), None);
+        assert!(e.undo());
+        assert_eq!(e.src, "# Title\n\nThe wrold is `wrold` here.\n");
     }
 
     #[test]

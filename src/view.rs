@@ -48,8 +48,12 @@ mod imp {
         pub blink: RefCell<Option<glib::SourceId>>,
         pub version: Cell<u64>,
         pub on_scrolled: RefCell<Option<ChangeHandler>>,
-        /// Right-click menu for tables.
-        pub table_menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The right-click menu, and the table sections it shows in tables.
+        pub context_menu: RefCell<Option<gtk::PopoverMenu>>,
+        pub table_sections: RefCell<Vec<gio::Menu>>,
+        pub spell: Cell<bool>,
+        /// The misspelled word the context menu was opened on.
+        pub typo: RefCell<Option<(std::ops::Range<usize>, String)>>,
         /// The document's folder once it has been saved; pasted images go
         /// into `images/` under it.
         pub doc_dir: RefCell<Option<PathBuf>>,
@@ -81,7 +85,10 @@ mod imp {
                 blink: RefCell::new(None),
                 version: Cell::new(0),
                 on_scrolled: RefCell::new(None),
-                table_menu: RefCell::new(None),
+                context_menu: RefCell::new(None),
+                table_sections: RefCell::new(Vec::new()),
+                spell: Cell::new(false),
+                typo: RefCell::new(None),
                 doc_dir: RefCell::new(None),
             }
         }
@@ -129,11 +136,11 @@ mod imp {
             obj.set_overflow(gtk::Overflow::Hidden);
             obj.add_css_class("view");
             obj.setup_input();
-            obj.setup_table_menu();
+            obj.setup_context_menu();
         }
 
         fn dispose(&self) {
-            if let Some(m) = self.table_menu.take() {
+            if let Some(m) = self.context_menu.take() {
                 m.unparent();
             }
         }
@@ -142,7 +149,7 @@ mod imp {
     impl WidgetImpl for DocView {
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             let obj = self.obj();
-            if let Some(m) = self.table_menu.borrow().as_ref() {
+            if let Some(m) = self.context_menu.borrow().as_ref() {
                 m.present();
             }
             obj.relayout(|e| {
@@ -228,6 +235,7 @@ impl DocView {
         let theme = imp.theme.borrow().clone();
         let mut e = Engine::new(self.pango_context(), src, doc, base_dir, theme, imp.zoom.get());
         e.set_width(self.width().max(1) as f64);
+        e.spell = imp.spell.get();
         // Keep already-decoded images across reloads.
         if let Some(old) = imp.eng.borrow_mut().as_mut() {
             e.images = std::mem::take(&mut old.images)
@@ -291,6 +299,41 @@ impl DocView {
         *self.imp().theme.borrow_mut() = theme.clone();
         if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
             e.set_theme(theme);
+        }
+        self.queue_draw();
+    }
+
+    /// Turn spell checking on or off. The dictionary loads in the
+    /// background the first time; words are marked once it is ready.
+    pub fn set_spell(&self, on: bool) {
+        self.imp().spell.set(on);
+        if on && !crate::spell::loaded() {
+            crate::spell::start();
+            glib::timeout_add_local(
+                Duration::from_millis(20),
+                clone!(
+                    #[weak(rename_to = obj)]
+                    self,
+                    #[upgrade_or]
+                    glib::ControlFlow::Break,
+                    move || {
+                        if !crate::spell::loaded() {
+                            return glib::ControlFlow::Continue;
+                        }
+                        obj.recheck_spelling();
+                        glib::ControlFlow::Break
+                    }
+                ),
+            );
+        }
+        self.recheck_spelling();
+    }
+
+    fn recheck_spelling(&self) {
+        let on = self.imp().spell.get();
+        if let Some(e) = self.imp().eng.borrow_mut().as_mut() {
+            e.spell = on;
+            e.recheck_spelling();
         }
         self.queue_draw();
     }
@@ -782,8 +825,9 @@ impl DocView {
         });
     }
 
-    /// Row/column/alignment actions (`table.*`) and their right-click menu.
-    fn setup_table_menu(&self) {
+    /// The right-click menu: spelling suggestions (`spell.*`) on a
+    /// misspelled word, row/column/alignment actions (`table.*`) in tables.
+    fn setup_context_menu(&self) {
         let group = gio::SimpleActionGroup::new();
         let ops = [
             ("row-above", TableOp::RowAbove),
@@ -806,7 +850,6 @@ impl DocView {
             group.add_action(&a);
         }
         self.insert_action_group("table", Some(&group));
-        let menu = gio::Menu::new();
         let section = |items: &[(&str, &str)]| {
             let m = gio::Menu::new();
             for (label, action) in items {
@@ -814,34 +857,91 @@ impl DocView {
             }
             m
         };
-        menu.append_section(None, &section(&[("Insert Row Above", "row-above"), ("Insert Row Below", "row-below")]));
-        menu.append_section(None, &section(&[("Insert Column Left", "col-left"), ("Insert Column Right", "col-right")]));
-        menu.append_section(None, &section(&[("Delete Row", "del-row"), ("Delete Column", "del-col")]));
-        menu.append_section(None, &section(&[("Align Left", "align-left"), ("Align Center", "align-center"), ("Align Right", "align-right")]));
-        let pop = gtk::PopoverMenu::from_model(Some(&menu));
+        *self.imp().table_sections.borrow_mut() = vec![
+            section(&[("Insert Row Above", "row-above"), ("Insert Row Below", "row-below")]),
+            section(&[("Insert Column Left", "col-left"), ("Insert Column Right", "col-right")]),
+            section(&[("Delete Row", "del-row"), ("Delete Column", "del-col")]),
+            section(&[("Align Left", "align-left"), ("Align Center", "align-center"), ("Align Right", "align-right")]),
+        ];
+
+        let group = gio::SimpleActionGroup::new();
+        let replace = gio::SimpleAction::new("replace", Some(glib::VariantTy::STRING));
+        replace.connect_activate(clone!(
+            #[weak(rename_to = obj)]
+            self,
+            move |_, v| {
+                let (Some(text), Some((r, _))) = (v.and_then(|v| v.get::<String>()), obj.imp().typo.take()) else { return };
+                obj.with_edit(|e| e.replace(r, &text));
+            }
+        ));
+        group.add_action(&replace);
+        for (name, session) in [("add", false), ("ignore", true)] {
+            let a = gio::SimpleAction::new(name, None);
+            a.connect_activate(clone!(
+                #[weak(rename_to = obj)]
+                self,
+                move |_, _| {
+                    if let Some((_, word)) = obj.imp().typo.take() {
+                        crate::spell::accept(&word, session);
+                        obj.recheck_spelling();
+                    }
+                }
+            ));
+            group.add_action(&a);
+        }
+        self.insert_action_group("spell", Some(&group));
+
+        let pop = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
         pop.set_parent(self);
         pop.set_has_arrow(false);
         pop.set_halign(gtk::Align::Start);
-        *self.imp().table_menu.borrow_mut() = Some(pop);
+        *self.imp().context_menu.borrow_mut() = Some(pop);
     }
 
-    /// Right click: put the caret there, and offer the table menu in tables.
+    /// Right click: put the caret there, and offer spelling suggestions on
+    /// a misspelled word and the table menu in tables.
     fn on_context(&self, x: f64, y: f64) {
         self.grab_focus();
-        let in_table = match self.hit_off(x, y) {
-            Some(off) => {
-                let mut in_table = false;
-                self.with_edit(|e| {
-                    if e.selection().is_none_or(|r| !r.contains(&off)) {
-                        e.set_caret(off, false, true);
-                    }
-                    in_table = e.in_table();
-                });
-                in_table
+        let (mut in_table, mut typo) = (false, None);
+        let imp = self.imp();
+        if let Some(off) = self.hit_off(x, y) {
+            self.with_edit(|e| {
+                if e.selection().is_none_or(|r| !r.contains(&off)) {
+                    e.set_caret(off, false, true);
+                }
+                in_table = e.in_table();
+            });
+            // After `with_edit`, so the block's source view is laid out.
+            if let Some(e) = imp.eng.borrow().as_ref() {
+                typo = e.typo_at(off).map(|r| (r.clone(), e.src[r].to_string()));
             }
-            None => false,
-        };
-        if let (true, Some(m)) = (in_table, self.imp().table_menu.borrow().as_ref()) {
+        }
+        let menu = gio::Menu::new();
+        if let Some((_, word)) = &typo {
+            let fixes = gio::Menu::new();
+            let suggestions = crate::spell::suggest(word);
+            for s in suggestions.iter().take(6) {
+                let item = gio::MenuItem::new(Some(s), None);
+                item.set_action_and_target_value(Some("spell.replace"), Some(&s.to_variant()));
+                fixes.append_item(&item);
+            }
+            if suggestions.is_empty() {
+                fixes.append(Some("No Suggestions"), Some("spell.none"));
+            }
+            menu.append_section(None, &fixes);
+            let keep = gio::Menu::new();
+            keep.append(Some("Add to Dictionary"), Some("spell.add"));
+            keep.append(Some("Ignore"), Some("spell.ignore"));
+            menu.append_section(None, &keep);
+        }
+        *imp.typo.borrow_mut() = typo;
+        if in_table {
+            for s in imp.table_sections.borrow().iter() {
+                menu.append_section(None, s);
+            }
+        }
+        if let (true, Some(m)) = (menu.n_items() > 0, imp.context_menu.borrow().as_ref()) {
+            m.set_menu_model(Some(&menu));
             m.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             m.popup();
         }

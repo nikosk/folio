@@ -1,10 +1,12 @@
 mod app;
 mod doc;
 mod editor;
+mod files;
 mod headless;
 mod highlight;
 mod layout;
 mod paint;
+mod spell;
 mod table;
 mod tex;
 mod theme;

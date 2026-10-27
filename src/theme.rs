@@ -29,6 +29,8 @@ pub struct Theme {
     pub caret: RGBA,
     /// Markdown syntax in the source view.
     pub syntax_mark: RGBA,
+    /// Wavy underline under misspelled words.
+    pub spell: RGBA,
     syn: [RGBA; 9],
     alerts: [RGBA; 5],
 }
@@ -64,6 +66,7 @@ impl Theme {
             on_accent: c(0xffffff, 1.0),
             caret: c(0x0b69d6, 1.0),
             syntax_mark: c(0x9aa3ad, 1.0),
+            spell: c(0xd1242f, 0.85),
             syn: [
                 c(0xcf222e, 1.0),
                 c(0x0a3069, 1.0),
@@ -100,6 +103,7 @@ impl Theme {
             on_accent: c(0x101214, 1.0),
             caret: c(0x6cb0ff, 1.0),
             syntax_mark: c(0x6b727c, 1.0),
+            spell: c(0xf85149, 0.85),
             syn: [
                 c(0xff7b72, 1.0),
                 c(0xa5d6ff, 1.0),
@@ -141,13 +145,31 @@ window.folio headerbar .title {{ font-weight: 600; }}
 window.folio headerbar .subtitle {{ font-size: 0.82em; color: {muted}; }}
 window.folio searchbar > revealer > box {{ background: {bg}; border-bottom: 1px solid {border}; }}
 window.folio .match-count {{ color: {muted}; font-size: 0.9em; }}
-window.folio .outline, window.folio .outline list {{ background: {side}; }}
-window.folio .outline {{ border-right: 1px solid {border}; }}
+window.folio .sidebar, window.folio .sidebar list, window.folio .sidebar listview {{ background: {side}; }}
+window.folio .sidebar {{ border-right: 1px solid {border}; }}
+window.folio .side-switcher {{ margin: 8px 8px 2px; }}
+window.folio .side-switcher button {{ background: none; box-shadow: none; border: none; border-radius: 6px; color: {muted}; padding: 3px 16px; margin: 0 2px; }}
+window.folio .side-switcher button:hover {{ background: alpha({fg}, 0.06); }}
+window.folio .side-switcher button:checked {{ background: {sel}; color: {fg}; font-weight: 600; }}
 window.folio .outline list {{ padding: 8px 0; }}
 window.folio .outline row {{ padding: 4px 10px; margin: 0 8px; border-radius: 6px; color: {fg}; }}
 window.folio .outline row:selected {{ background: {sel}; color: {fg}; }}
 window.folio .outline .top {{ font-weight: 600; }}
-window.folio .outline .dim, window.folio .outline .dim label {{ color: {muted}; }}",
+window.folio .outline .dim, window.folio .outline .dim label {{ color: {muted}; }}
+window.folio .files-head {{ padding: 6px 8px 2px 14px; }}
+window.folio .files-root {{ font-size: 0.85em; color: {muted}; }}
+window.folio .files {{ padding: 2px 0 8px; }}
+window.folio .files row {{ padding: 0; margin: 0 8px; border-radius: 6px; color: {fg}; }}
+window.folio .files row:hover {{ background: alpha({fg}, 0.06); }}
+window.folio .files treeexpander {{ padding: 3px 8px 3px 4px; border-radius: 6px; }}
+window.folio .files treeexpander.current {{ background: {sel}; font-weight: 600; }}
+window.folio .files image {{ color: {muted}; }}
+window.folio .quick-open {{ background: {bg}; border: 1px solid {border}; border-radius: 10px; padding: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.22); }}
+window.folio .quick-open list {{ background: transparent; }}
+window.folio .quick-open row {{ padding: 5px 8px; border-radius: 6px; color: {fg}; }}
+window.folio .quick-open row:selected {{ background: {sel}; color: {fg}; }}
+window.folio .quick-open .name {{ font-weight: 600; }}
+window.folio .quick-open .dim {{ color: {muted}; font-size: 0.9em; }}",
             bg = hex(&self.bg),
             border = hex(&self.border),
             muted = hex(&self.muted),

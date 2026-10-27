@@ -101,6 +101,8 @@ struct Laid {
     deco: Vec<Deco>,
     table: Option<(Vec<f64>, Vec<f64>)>,
     img: Option<(gdk::Texture, f64, f64, f64, f64)>,
+    /// Misspelled words: (part, start, end) in the part's text.
+    typos: Vec<(usize, u32, u32)>,
 }
 
 struct Fonts {
@@ -233,6 +235,8 @@ pub struct Engine {
     /// Uncommitted input-method text, drawn at the caret.
     pub preedit: String,
     pub ed: crate::editor::EditState,
+    /// Underline misspelled words (in blocks as they are laid out for display).
+    pub spell: bool,
 }
 
 impl Engine {
@@ -265,6 +269,7 @@ impl Engine {
             caret_on: true,
             preedit: String::new(),
             ed: Default::default(),
+            spell: false,
         };
         e.compute_gaps();
         for i in 0..n {
@@ -541,11 +546,50 @@ impl Engine {
 
     fn ensure_block(&mut self, i: usize) {
         if self.cache[i].is_none() {
-            let laid = self.build(i);
+            let mut laid = self.build(i);
+            laid.typos = self.typos(i);
             self.set_measured(i, laid.h);
             self.cache[i] = Some(laid);
             self.n_cached += 1;
         }
+    }
+
+    /// Misspelled words of block `i`; only prose is checked.
+    fn typos(&self, i: usize) -> Vec<(usize, u32, u32)> {
+        let b = &self.doc.blocks[i];
+        let prose = matches!(
+            b.kind,
+            Kind::Para(_) | Kind::Heading { .. } | Kind::Table { .. } | Kind::Source { style: SrcStyle::Text | SrcStyle::Heading(_), .. }
+        );
+        if !self.spell || !prose || !crate::spell::ready() {
+            return Vec::new();
+        }
+        (0..b.part_count())
+            .filter_map(|p| b.part_rich(p).map(|r| (p, r)))
+            .flat_map(|(p, r)| crate::spell::typos(r).into_iter().map(move |(s, e)| (p, s, e)))
+            .collect()
+    }
+
+    /// Re-check the laid-out blocks (spell checking toggled, the dictionary
+    /// finished loading, or a word was added to it).
+    pub fn recheck_spelling(&mut self) {
+        for i in 0..self.len() {
+            if self.cache[i].is_some() {
+                let t = self.typos(i);
+                if let Some(l) = self.cache[i].as_mut() {
+                    l.typos = t;
+                }
+            }
+        }
+    }
+
+    /// The source range of the misspelled word at source offset `off`.
+    pub fn typo_at(&self, off: usize) -> Option<std::ops::Range<usize>> {
+        let p = self.off_to_pos(off);
+        let laid = self.cache.get(p.block)?.as_ref()?;
+        let &(_, s, e) = laid.typos.iter().find(|t| t.0 == p.part && t.1 as usize <= p.idx && p.idx <= t.2 as usize)?;
+        let b = &self.doc.blocks[p.block];
+        Some(b.text_to_src(p.part, s as usize)..b.text_to_src(p.part, e as usize))
     }
 
     /// Lay out every block intersecting [top, bottom).
@@ -711,6 +755,15 @@ impl Engine {
                 }
             }
             p.layout(&part.l, px0, py0, &part.color);
+            for &(_, s, e) in laid.typos.iter().filter(|t| t.0 == pi) {
+                // Not the word being typed (caret at its end).
+                if self.caret.is_some_and(|c| c.block == i && c.part == pi && c.idx == e as usize) {
+                    continue;
+                }
+                for (rx, rw, _, _, base) in range_rects(&part.l, part.layout_idx(s as usize, true), part.layout_idx(e as usize, false), part.w) {
+                    wave(p, px0 + rx, px0 + rx + rw, py0 + base + 0.16 * em, em, &th.spell);
+                }
+            }
             if let Some(c) = self.caret.filter(|c| c.block == i && c.part == pi) {
                 let (pos, _) = part.l.cursor_pos(part.layout_idx(c.idx, true) as i32);
                 let (cx, cy, ch) = (px0 + px(pos.x()), py0 + px(pos.y()), px(pos.height()));
@@ -1090,6 +1143,20 @@ fn range_rects(l: &pango::Layout, s: usize, e: usize, w: f64) -> Vec<(f64, f64, 
         }
     }
     v
+}
+
+/// A wavy underline from x0 to x1, centred on y, sized for font size `em`.
+fn wave(p: &mut dyn Painter, x0: f64, x1: f64, y: f64, em: f64, c: &RGBA) {
+    let (step, amp, lw) = (0.13 * em, 0.07 * em, (0.07 * em).max(1.0));
+    let mut x = x0;
+    let mut up = false;
+    while x < x1 {
+        let nx = (x + step).min(x1);
+        let (ya, yb) = if up { (y + amp, y - amp) } else { (y - amp, y + amp) };
+        p.line(x, ya, nx, yb, lw, c);
+        x = nx;
+        up = !up;
+    }
 }
 
 fn heading_scale(level: u8) -> f64 {

@@ -1,6 +1,7 @@
 //! Application shell: windows, actions, file loading and live reload.
 
 use crate::doc::{self, Doc};
+use crate::files::{self, is_markdown, FileTree, QuickOpen};
 use crate::theme::Theme;
 use crate::view::DocView;
 use gtk::gdk;
@@ -45,8 +46,11 @@ fn load(path: &Path) -> std::io::Result<(String, Doc)> {
 
 struct State {
     dark: Cell<bool>,
-    /// Outline sidebar shown; new windows follow the last choice.
-    outline: Cell<bool>,
+    /// Sidebar shown, and its page ("outline" or "files"); new windows
+    /// follow the last choice.
+    sidebar: Cell<bool>,
+    side_page: RefCell<String>,
+    spell: Cell<bool>,
     css: gtk::CssProvider,
     windows: RefCell<Vec<Weak<Win>>>,
     gsettings: RefCell<Option<gio::Settings>>,
@@ -62,6 +66,28 @@ fn state() -> Rc<State> {
 
 fn theme() -> Theme {
     if state().dark.get() { Theme::dark() } else { Theme::light() }
+}
+
+/// Preferences kept between runs, as `key=value` lines in
+/// `~/.config/folio/settings`.
+fn settings_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("folio").join("settings"))
+}
+
+fn load_settings() -> Vec<(String, String)> {
+    let text = settings_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect()
+}
+
+fn save_settings() {
+    let st = state();
+    let text = format!("spell={}\nsidebar={}\nside_page={}\n", st.spell.get(), st.sidebar.get(), st.side_page.borrow());
+    if let Some(f) = settings_file() {
+        let _ = std::fs::create_dir_all(f.parent().unwrap_or(&f)).and_then(|_| std::fs::write(&f, text));
+    }
 }
 
 fn system_dark(settings: Option<&gio::Settings>) -> bool {
@@ -118,9 +144,13 @@ fn startup(app: &gtk::Application) {
     if let Some(s) = &settings {
         s.connect_changed(Some("color-scheme"), |s, _| apply_theme(system_dark(Some(s))));
     }
+    let saved = load_settings();
+    let get = |k: &str| saved.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
     let st = Rc::new(State {
         dark: Cell::new(dark),
-        outline: Cell::new(false),
+        sidebar: Cell::new(get("sidebar") == Some("true")),
+        side_page: RefCell::new(get("side_page").filter(|p| *p == "files").unwrap_or("outline").into()),
+        spell: Cell::new(get("spell") != Some("false")),
         css,
         windows: RefCell::new(Vec::new()),
         gsettings: RefCell::new(settings),
@@ -149,11 +179,24 @@ fn startup(app: &gtk::Application) {
         }
     ));
     app.add_action(&new);
+    let spell = gio::SimpleAction::new_stateful("spell", None, &state().spell.get().to_variant());
+    spell.connect_activate(|a, _| {
+        let on = !state().spell.get();
+        state().spell.set(on);
+        save_settings();
+        a.set_state(&on.to_variant());
+        for w in state().windows.borrow().iter().filter_map(Weak::upgrade) {
+            w.view.set_spell(on);
+        }
+    });
+    app.add_action(&spell);
 
     for (action, accels) in [
         ("app.quit", &["<Ctrl>q"][..]),
         ("app.toggle-theme", &["<Ctrl>d"]),
-        ("win.outline", &["F9"]),
+        ("app.spell", &["F7"]),
+        ("win.sidebar", &["F9"]),
+        ("win.quick-open", &["<Ctrl>p"]),
         ("app.new", &["<Ctrl>n"]),
         ("win.open", &["<Ctrl>o"]),
         ("win.save", &["<Ctrl>s"]),
@@ -187,8 +230,13 @@ struct Win {
     reload_timer: RefCell<Option<glib::SourceId>>,
     /// Set once the user chose to close despite unsaved changes.
     closing: Cell<bool>,
-    outline_btn: gtk::ToggleButton,
+    side_btn: gtk::ToggleButton,
+    side_stack: gtk::Stack,
     outline_list: gtk::ListBox,
+    files: Rc<FileTree>,
+    quick: Rc<QuickOpen>,
+    /// The folder the files sidebar and quick open show.
+    root: RefCell<Option<PathBuf>>,
     /// The headings the list shows: (level, text, source offset).
     outline: RefCell<Vec<(u8, String, usize)>>,
 }
@@ -217,11 +265,15 @@ impl Win {
         header.set_title_widget(Some(&titles));
         let file_menu = gio::Menu::new();
         file_menu.append(Some("Open…"), Some("win.open"));
+        file_menu.append(Some("Go to File…"), Some("win.quick-open"));
         let this_file = gio::Menu::new();
         this_file.append(Some("Copy Path"), Some("win.copy-path"));
         this_file.append(Some("Show in Files"), Some("win.show-in-files"));
         this_file.append(Some("Open With…"), Some("win.open-with"));
         file_menu.append_section(None, &this_file);
+        let options = gio::Menu::new();
+        options.append(Some("Check Spelling"), Some("app.spell"));
+        file_menu.append_section(None, &options);
         let menu_btn = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .tooltip_text("File")
@@ -236,10 +288,10 @@ impl Win {
         theme_btn.set_tooltip_text(Some("Toggle dark mode (Ctrl+D)"));
         theme_btn.set_action_name(Some("app.toggle-theme"));
         header.pack_end(&theme_btn);
-        let outline_btn = gtk::ToggleButton::new();
-        outline_btn.set_icon_name("sidebar-show-symbolic");
-        outline_btn.set_tooltip_text(Some("Outline (F9)"));
-        header.pack_start(&outline_btn);
+        let side_btn = gtk::ToggleButton::new();
+        side_btn.set_icon_name("sidebar-show-symbolic");
+        side_btn.set_tooltip_text(Some("Sidebar (F9)"));
+        header.pack_start(&side_btn);
         let find_btn = gtk::ToggleButton::new();
         find_btn.set_icon_name("edit-find-symbolic");
         find_btn.set_tooltip_text(Some("Find (Ctrl+F)"));
@@ -275,16 +327,30 @@ impl Win {
         outline_list.set_placeholder(Some(&gtk::Label::builder().label("No headings").css_classes(["dim"]).margin_top(12).build()));
         let outline_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .width_request(240)
             .child(&outline_list)
             .build();
         outline_scroll.add_css_class("outline");
+        let side_stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(100)
+            .vexpand(true)
+            .build();
+        side_stack.add_titled(&outline_scroll, Some("outline"), "Outline");
+        let switcher = gtk::StackSwitcher::builder().stack(&side_stack).halign(gtk::Align::Center).build();
+        switcher.add_css_class("side-switcher");
+        let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        side.add_css_class("sidebar");
+        side.set_width_request(260);
+        // Its rows expand; the sidebar itself must not take the window's width.
+        side.set_hexpand(false);
+        side.append(&switcher);
+        side.append(&side_stack);
         let outline_rev = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::SlideRight)
             .transition_duration(150)
-            .child(&outline_scroll)
+            .child(&side)
             .build();
-        outline_btn.bind_property("active", &outline_rev, "reveal-child").sync_create().build();
+        side_btn.bind_property("active", &outline_rev, "reveal-child").sync_create().build();
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         hbox.append(&outline_rev);
         hbox.append(&scroller);
@@ -292,11 +358,14 @@ impl Win {
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         vbox.append(&search);
         vbox.append(&hbox);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&vbox));
         win.set_titlebar(Some(&header));
-        win.set_child(Some(&vbox));
+        win.set_child(Some(&overlay));
         view.set_theme(theme());
+        view.set_spell(state().spell.get());
 
-        let w = Rc::new(Win {
+        let w = Rc::new_cyclic(|me: &Weak<Win>| Win {
             win,
             view,
             title,
@@ -309,10 +378,46 @@ impl Win {
             monitor: RefCell::new(None),
             reload_timer: RefCell::new(None),
             closing: Cell::new(false),
-            outline_btn,
+            side_btn,
+            side_stack,
             outline_list,
+            files: FileTree::new(
+                clone!(
+                    #[strong]
+                    me,
+                    move |p| if let Some(w) = me.upgrade() {
+                        w.open(p, true);
+                    }
+                ),
+                clone!(
+                    #[strong]
+                    me,
+                    move |root| if let Some(w) = me.upgrade() {
+                        *w.root.borrow_mut() = Some(root);
+                    }
+                ),
+            ),
+            quick: QuickOpen::new(
+                clone!(
+                    #[strong]
+                    me,
+                    move |p| if let Some(w) = me.upgrade() {
+                        w.open(p, true);
+                    }
+                ),
+                clone!(
+                    #[strong]
+                    me,
+                    move || if let Some(w) = me.upgrade() {
+                        w.view.grab_focus();
+                    }
+                ),
+            ),
+            root: RefCell::new(None),
             outline: RefCell::new(Vec::new()),
         });
+        w.side_stack.add_titled(&w.files.widget, Some("files"), "Files");
+        overlay.add_overlay(&w.quick.widget);
         state().windows.borrow_mut().push(Rc::downgrade(&w));
         w.setup_actions();
         w.setup_search();
@@ -330,9 +435,15 @@ impl Win {
             None => {
                 w.view.set_empty();
                 w.update_titles();
+                // Untitled: browse the working directory, unless that is
+                // just the home folder (launched from the desktop).
+                let cwd = std::env::current_dir().ok().filter(|d| Some(d.as_os_str()) != std::env::var_os("HOME").as_deref() && d.parent().is_some());
+                *w.root.borrow_mut() = cwd.map(|d| files::project_root(&d));
             }
         }
-        w.outline_btn.set_active(state().outline.get());
+        let page = state().side_page.borrow().clone();
+        w.side_stack.set_visible_child_name(&page);
+        w.side_btn.set_active(state().sidebar.get());
         crate::mark("window built, document loaded");
         w.win.present();
         crate::mark("presented");
@@ -344,7 +455,8 @@ impl Win {
     }
 
     /// Debug hook: FOLIO_SCREENSHOT=out.png [FOLIO_SCROLL=y] [FOLIO_FIND=text]
-    /// [FOLIO_DELAY=ms] renders the live window with GTK's renderer, saves it
+    /// [FOLIO_SIDEBAR=outline|files] [FOLIO_QUICK=query] [FOLIO_DELAY=ms]
+    /// renders the live window with GTK's renderer, saves it
     /// and exits. FOLIO_DELAY leaves time for scripted input.
     fn debug_screenshot(self: &Rc<Self>, out: String) {
         let w = self.clone();
@@ -356,6 +468,14 @@ impl Win {
             }
             if let Some(y) = std::env::var("FOLIO_SCROLL").ok().and_then(|y| y.parse().ok()) {
                 w.view.scroll_to(y);
+            }
+            if let Ok(page) = std::env::var("FOLIO_SIDEBAR") {
+                w.side_stack.set_visible_child_name(&page);
+                w.side_btn.set_active(true);
+            }
+            if let Ok(q) = std::env::var("FOLIO_QUICK") {
+                w.quick.show(w.root.borrow().clone());
+                w.quick.entry.set_text(&q);
             }
             glib::timeout_add_local_once(Duration::from_millis(400), move || {
                 let paintable = gtk::WidgetPaintable::new(Some(&w.win));
@@ -407,6 +527,13 @@ impl Win {
         });
         self.action("show-in-files", |w| w.launch(false));
         self.action("open-with", |w| w.launch(true));
+        self.action("quick-open", |w| {
+            if w.quick.is_open() {
+                w.quick.hide();
+            } else {
+                w.quick.show(w.root.borrow().clone());
+            }
+        });
         self.action("back", |w| {
             let prev = w.history.borrow_mut().pop();
             if let Some(p) = prev {
@@ -571,8 +698,10 @@ impl Win {
             }
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         self.view.set_doc(src, doc, base.clone(), false);
+        self.set_root_for(&path);
         self.view.set_doc_dir(Some(base));
         self.refresh_outline();
+        self.refresh_files();
         self.update_titles();
         self.watch(&path);
         self.refresh_search();
@@ -616,15 +745,52 @@ impl Win {
         });
     }
 
+    /// Keep showing the current folder while `path` is inside it; otherwise
+    /// switch to the file's project (git work tree) or folder.
+    fn set_root_for(&self, path: &Path) {
+        let inside = self.root.borrow().as_ref().is_some_and(|r| path.starts_with(r));
+        if !inside && let Some(dir) = path.parent() {
+            *self.root.borrow_mut() = Some(files::project_root(dir));
+        }
+    }
+
+    /// Update the files sidebar (only while it is shown).
+    fn refresh_files(&self) {
+        if !self.side_btn.is_active() || self.side_stack.visible_child_name().as_deref() != Some("files") {
+            return;
+        }
+        if let Some(root) = self.root.borrow().as_ref() {
+            self.files.set_root(root);
+        }
+        self.files.set_current(self.path.borrow().as_deref());
+    }
+
     fn setup_outline(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.outline_btn.connect_active_notify(move |b| {
-            state().outline.set(b.is_active());
+        self.side_btn.connect_active_notify(move |b| {
+            if state().sidebar.replace(b.is_active()) != b.is_active() {
+                save_settings();
+            }
             if let Some(w) = weak.upgrade() {
                 w.refresh_outline();
+                w.refresh_files();
             }
         });
-        self.action("outline", |w| w.outline_btn.set_active(!w.outline_btn.is_active()));
+        let weak = Rc::downgrade(self);
+        self.side_stack.connect_visible_child_name_notify(move |s| {
+            if let Some(name) = s.visible_child_name() {
+                let changed = *state().side_page.borrow() != name;
+                if changed {
+                    *state().side_page.borrow_mut() = name.to_string();
+                    save_settings();
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                w.refresh_outline();
+                w.refresh_files();
+            }
+        });
+        self.action("sidebar", |w| w.side_btn.set_active(!w.side_btn.is_active()));
         let weak = Rc::downgrade(self);
         self.outline_list.connect_row_activated(move |_, row| {
             let Some(w) = weak.upgrade() else { return };
@@ -643,7 +809,7 @@ impl Win {
 
     /// Rebuild the outline rows if the headings changed (only while shown).
     fn refresh_outline(&self) {
-        if !self.outline_btn.is_active() {
+        if !self.side_btn.is_active() {
             return;
         }
         let new: Vec<(u8, String, usize)> = self.view.outline().into_iter().map(|h| (h.level, h.text, h.off)).collect();
@@ -679,7 +845,7 @@ impl Win {
 
     /// Select the row of the section at the top of the view.
     fn highlight_outline(&self) {
-        if !self.outline_btn.is_active() {
+        if !self.side_btn.is_active() {
             return;
         }
         let row = self.view.current_heading().and_then(|i| self.outline_list.row_at_index(i as i32));
@@ -766,6 +932,8 @@ impl Win {
                 w.view.set_base_dir(dir.clone());
                 w.view.set_doc_dir(Some(dir));
                 *w.path.borrow_mut() = Some(path.clone());
+                w.set_root_for(&path);
+                w.refresh_files();
                 w.watch(&path);
                 w.update_titles();
                 then(&w);
@@ -873,10 +1041,4 @@ impl Win {
         }
         *self.monitor.borrow_mut() = monitor;
     }
-}
-
-fn is_markdown(p: &Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd" | "mdx" | "txt"))
 }

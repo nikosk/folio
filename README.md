@@ -179,7 +179,7 @@ folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--s
 folio --bench FILE                     # engine and typing timings, no display needed
 python3 samples/gen_big.py             # generate samples/big.md for benchmarking
 FOLIO_STARTUP=1 folio FILE             # print startup phase timings, exit after first frame
-FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND, FOLIO_SIDEBAR, FOLIO_QUICK)
+FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND, FOLIO_SIDEBAR, FOLIO_QUICK, FOLIO_OPEN)
 scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE   # no display needed
 scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(300, 400)" "type('hi')"   # scripted input
 ```

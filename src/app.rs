@@ -478,7 +478,7 @@ impl Win {
     }
 
     /// Debug hook: FOLIO_SCREENSHOT=out.png [FOLIO_SCROLL=y] [FOLIO_FIND=text]
-    /// [FOLIO_SIDEBAR=outline|files] [FOLIO_QUICK=query] [FOLIO_DELAY=ms]
+    /// [FOLIO_SIDEBAR=outline|files] [FOLIO_QUICK=query] [FOLIO_OPEN=file] [FOLIO_DELAY=ms]
     /// renders the live window with GTK's renderer, saves it
     /// and exits. FOLIO_DELAY leaves time for scripted input.
     fn debug_screenshot(self: &Rc<Self>, out: String) {
@@ -495,6 +495,10 @@ impl Win {
             if let Ok(page) = std::env::var("FOLIO_SIDEBAR") {
                 w.side_stack.set_visible_child_name(&page);
                 w.side_btn.set_active(true);
+            }
+            // Same as clicking the file in the files sidebar.
+            if let Ok(p) = std::env::var("FOLIO_OPEN") {
+                w.open(PathBuf::from(p), true);
             }
             if let Ok(q) = std::env::var("FOLIO_QUICK") {
                 w.quick.show(w.root.borrow().clone(), state().hidden.get());

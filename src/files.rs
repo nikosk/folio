@@ -140,13 +140,16 @@ struct Shown {
 
 impl Shown {
     fn changed(&self) {
-        self.filters.borrow_mut().retain(|f| match f.upgrade() {
-            Some(f) => {
-                f.changed(gtk::FilterChange::Different);
-                true
-            }
-            None => false,
-        });
+        let live: Vec<gtk::CustomFilter> = {
+            let mut filters = self.filters.borrow_mut();
+            filters.retain(|f| f.upgrade().is_some());
+            filters.iter().filter_map(|f| f.upgrade()).collect()
+        };
+        // Not while borrowed: refiltering can add rows, and GTK then creates
+        // their folders' models, which register new filters.
+        for f in live {
+            f.changed(gtk::FilterChange::Different);
+        }
     }
 }
 
@@ -463,10 +466,9 @@ impl FileTree {
                     t.watch_git(&st.git_dir);
                 }
                 *t.git.borrow_mut() = st.map(Rc::new);
-                for (w, p, dir) in t.rows.borrow().iter() {
-                    if let Some(w) = w.upgrade() {
-                        t.apply_git(&w, p, *dir);
-                    }
+                let rows: Vec<_> = t.rows.borrow().iter().filter_map(|(w, p, dir)| Some((w.upgrade()?, p.clone(), *dir))).collect();
+                for (w, p, dir) in rows {
+                    t.apply_git(&w, &p, dir);
                 }
             });
         });

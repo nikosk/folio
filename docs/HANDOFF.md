@@ -234,7 +234,13 @@ The agent's shell has no display. What works:
   (it now sets `hexpand(false)`); an ellipsized label still asks for its
   full text width, so long names widened the sidebar until the labels got
   `max_width_chars`; a widget can only `grab_focus` once
-  mapped (go to file focuses its entry in `connect_map`).
+  mapped (go to file focuses its entry in `connect_map`). And never hold a
+  `RefCell` borrow while calling into GTK models: GTK re-enters our code
+  synchronously (refiltering the tree creates folder models, which register
+  filters), and a held borrow then panics (the 0.5.1 crash).
+- `FOLIO_OPEN=file` in a `FOLIO_SCREENSHOT` run opens a file the way a click
+  in the files sidebar does; it reproduced that crash where clicks in the
+  harness were too unreliable.
   `FOLIO_STARTUP=1` prints startup phase timings and memory use. GL in this
   harness is software-rendered, so GPU startup numbers are pessimistic.
 - Dead ends, don't retry: GTK's Broadway backend plus headless Chromium (new

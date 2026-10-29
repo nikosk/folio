@@ -868,6 +868,12 @@ impl Engine {
         self.edit(r, text, None);
     }
 
+    /// Replace several source ranges (sorted, disjoint) with `text`, as one
+    /// undo step.
+    pub fn replace_all(&mut self, ranges: &[Range<usize>], text: &str) {
+        self.multi_edit(ranges.iter().map(|r| (r.start, r.len(), text.to_string())).collect());
+    }
+
     /// Typed or pasted text replaces the selection.
     pub fn insert(&mut self, text: &str) {
         let Some(r) = self.sel_or_caret() else { return };
@@ -1537,6 +1543,61 @@ mod tests {
         assert_eq!(e.typo_at(15), None);
         assert!(e.undo());
         assert_eq!(e.src, "# Title\n\nThe wrold is `wrold` here.\n");
+    }
+
+    #[test]
+    fn find_and_replace() {
+        let src = "Foo and **foo** here, `foo` too.\n\n- a foo item\n\nsplit a **b** c\n";
+        let mut e = engine(src);
+        assert_eq!(e.find("foo", false), 4);
+        assert_eq!(e.find("foo", true), 3, "match case skips Foo");
+        e.find("foo", false);
+        let ranges: Vec<_> = (0..e.matches.len()).filter_map(|k| e.match_src(k)).collect();
+        assert_eq!(ranges.len(), 4);
+        assert!(ranges.iter().all(|r| e.src[r.clone()].eq_ignore_ascii_case("foo")));
+        e.replace_all(&ranges, "bar");
+        assert_eq!(e.src, "bar and **bar** here, `bar` too.\n\n- a bar item\n\nsplit a **b** c\n");
+        check(&e);
+        // One undo step brings it all back.
+        assert!(e.undo());
+        assert_eq!(e.src, src);
+        // Text found across formatting has no source range of its own.
+        assert_eq!(e.find("a b c", false), 1);
+        assert_eq!(e.match_src(0), None);
+        // Replacing one match leaves the others.
+        e.find("foo", true);
+        let r = e.match_src(0).unwrap();
+        e.replace(r, "x");
+        assert_eq!(e.src, "Foo and **x** here, `foo` too.\n\n- a foo item\n\nsplit a **b** c\n");
+        check(&e);
+    }
+
+    /// Typing in a diagram: only the version typed last is rasterized, and
+    /// versions typed past are dropped.
+    #[test]
+    fn typing_in_a_diagram() {
+        let src = "```mermaid\nflowchart TD\n  A --> B\n```\n";
+        let mut e = engine(src);
+        e.ensure(0.0, 800.0);
+        assert_eq!(e.take_diagram_requests().len(), 1);
+        let at = src.find("B\n").unwrap() + 1;
+        e.set_caret(at, false, true);
+        for ch in " --> C".chars() {
+            e.insert(&ch.to_string());
+            e.ensure(0.0, 800.0);
+        }
+        assert!(e.src.contains("A --> B --> C"));
+        let reqs = e.take_diagram_requests();
+        assert_eq!(reqs.len(), 1, "one raster for the text as it is now");
+        assert_eq!(e.diagrams.len(), 1, "earlier versions dropped");
+    }
+
+    /// A drawn diagram's text is neither found nor replaced; a broken one
+    /// (shown as code) is.
+    #[test]
+    fn find_skips_drawn_diagrams() {
+        let mut e = engine("graph here\n\n```mermaid\nflowchart TD\n  A[graph] --> B\n```\n\n```mermaid\ngraph -->\n```\n");
+        assert_eq!(e.find("graph", false), 2, "the paragraph and the broken diagram");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Folio goes after v0.5.0. The goals from `HANDOFF.md` still decide
+Where Folio goes after v0.6.0. The goals from `HANDOFF.md` still decide
 trade-offs: speed first, then looks, then Markdown coverage. Smaller fixes to
 existing features stay in `HANDOFF.md` ("Next steps").
 
@@ -9,8 +9,8 @@ existing features stay in `HANDOFF.md` ("Next steps").
 | Release | Contents |
 |---|---|
 | **0.5** (released) | Files sidebar and go to file (`Ctrl+P`); spell check |
-| **0.6** | Find & replace; images visible while their block is edited; word count |
-| **0.7** | Change tracking (see below) |
+| **0.6** (released) | Mermaid diagrams; find & replace |
+| **0.7** | Change tracking (see below); images visible while their block is edited; word count |
 | **0.8** | Export to HTML and PDF, printing; rich copy and paste |
 | Later, maybe | Focus and typewriter modes, wiki links with backlinks, custom themes |
 
@@ -18,26 +18,31 @@ existing features stay in `HANDOFF.md` ("Next steps").
 
 Ranked by how much they are missed in daily use.
 
-1. **Find & replace.** Find exists; replace doesn't. Replace-all should be
-   one undo step through `multi_edit`, as list indent is.
-2. **Export and print.** HTML comes from pulldown-cmark's HTML output plus
+1. **Export and print.** HTML comes from pulldown-cmark's HTML output plus
    the theme as CSS. PDF and printing go through `GtkPrintOperation`, which
    hands out a Cairo context per page, so the existing Cairo painter
    (`paint.rs`) can draw pages; the new work is splitting the layout into
    pages.
-3. **Rich clipboard.** Paste HTML (from browsers, Google Docs) as Markdown;
+2. **Rich clipboard.** Paste HTML (from browsers, Google Docs) as Markdown;
    copy HTML alongside Markdown so formatting survives a paste into mail.
 
-Done in 0.5: the files sidebar, go to file, and spell check.
+Done: the files sidebar, go to file and spell check (0.5); Mermaid diagrams
+and find & replace (0.6).
 
-Also missing: focus and typewriter modes, word count (planned for 0.6).
+Also missing: focus and typewriter modes, word count (planned for 0.7).
 
 ### Left out on purpose
 
-Mermaid diagrams and TeX-quality math. Typora renders both with JavaScript
-libraries; doing them properly without a web view means writing a layout
-engine for each, which costs the speed and size Folio exists for. Math stays
-TeX converted to Unicode, and diagrams stay code blocks.
+TeX-quality math. Typora renders it with a JavaScript library; doing it
+properly without a web view means writing a math layout engine, which costs
+the speed and size Folio exists for. Math stays TeX converted to Unicode.
+
+Mermaid was in this list until 0.6: pure-Rust renderers appeared. Compared
+on seven diagram types (`mermaid-svg`, `mermaid-rs-renderer`, `merman`),
+`mermaid-svg` won: under 0.1 ms per diagram, +1.3 MB, 9 crates, plain SVG
+text the system loader draws. `merman` (+21 MB, 216 crates) lost the spaces
+between words through librsvg, and `mermaid-rs-renderer` (+4.4 MB) routed
+flowchart and state edges poorly.
 
 ## Change tracking: the feature Typora doesn't have
 

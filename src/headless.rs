@@ -88,7 +88,7 @@ pub fn run(args: &[String]) -> ExitCode {
         e.paint(&mut CairoPainter(&cr), 0.0, h);
         let t_paint = t.elapsed();
         let t = Instant::now();
-        let n = e.find("the");
+        let n = e.find("the", false);
         let t_find = t.elapsed();
         let typing = bench_typing(&mut e, h);
         frames.sort();
@@ -118,6 +118,22 @@ pub fn run(args: &[String]) -> ExitCode {
             );
         }
         println!("full re-parses during typing: {}", e.ed.full_parses);
+        let n_the = e.find("the", false);
+        let ranges: Vec<_> = (0..e.matches.len()).filter_map(|k| e.match_src(k)).collect();
+        let t = Instant::now();
+        e.replace_all(&ranges, "thy");
+        e.ensure(0.0, h);
+        let t_replace = t.elapsed();
+        let t = Instant::now();
+        e.undo();
+        e.ensure(0.0, h);
+        println!(
+            "replace all   {:7.2} ms  ({} of {} matches of 'the'; undo {:.2} ms)",
+            ms(t_replace),
+            ranges.len(),
+            n_the,
+            ms(t.elapsed())
+        );
         let t = Instant::now();
         load_spell();
         println!("spell: dictionary loaded in {:.1} ms (worker thread)", ms(t.elapsed()));
@@ -155,8 +171,12 @@ pub fn run(args: &[String]) -> ExitCode {
     for _ in 0..4 {
         e.ensure(scroll, scroll + h);
         let reqs: Vec<_> = std::mem::take(&mut e.img_requests);
-        if reqs.is_empty() {
+        let diagrams = e.take_diagram_requests();
+        if reqs.is_empty() && diagrams.is_empty() {
             break;
+        }
+        for (key, svg, w, h) in diagrams {
+            e.diagram_ready(key, crate::diagram::rasterize(&svg, w, h));
         }
         for p in reqs {
             let img = gdk::Texture::from_filename(&p).map_or(Img::Failed, Img::Ready);
@@ -173,6 +193,10 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     if let Some(c) = caret {
         e.set_caret(c, false, true);
+        e.ensure(scroll, scroll + h);
+        for (key, svg, w, h) in e.take_diagram_requests() {
+            e.diagram_ready(key, crate::diagram::rasterize(&svg, w, h));
+        }
         e.ensure(scroll, scroll + h);
     }
     let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32).unwrap();

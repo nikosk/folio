@@ -26,6 +26,7 @@ doesn't say.
 | Remote images not fetched | No network code. Remote images render as link chips. |
 | Spell check through libenchant, opened with `dlopen` | Enchant is what GNOME apps use (Hunspell/Nuspell/Aspell dictionaries, shared personal word list in `~/.config/enchant`). `dlopen` on a worker thread keeps it out of the build (no `-dev` package, no crate) and off the startup path; without the library spell check is just unavailable. Measured: 3–4 ms to load, 1.5–2 ms to check a screen with an empty cache. |
 | Files sidebar and go to file show the git work tree | The project is usually what you want to browse (`docs/HANDOFF.md` → the repo); outside a repo it is the document's folder, and the home folder itself never counts as a project. Opening a file inside the shown folder keeps it. |
+| Mermaid through the `mermaid-svg` crate | Chosen after rendering seven diagram types with three pure-Rust renderers (see ROADMAP "Left out on purpose"): fastest, smallest, and its plain SVG text works with the system SVG loader. Rendering to SVG is so cheap that layout does it inline and knows the size at once. |
 | `folio --update` is a shell script | Keeps network code out of the binary: `src/update.sh` (embedded with `include_str!`) uses curl or wget, checks the release's `.sha256` and runs the release's `install.sh`, which installs to `~/.local/bin`. It depends on the release asset names in `release.yml`. No update check at startup (startup speed, no network). |
 
 ## v2 status
@@ -102,7 +103,7 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   more than it is worth so far).
 - **Go to file** (`files::QuickOpen`): an overlay over the window. Each
   `Ctrl+P` walks the folder again on `gio::spawn_blocking` (hidden files
-  only with `Ctrl+H`; never `.git`, `node_modules`, `target`; capped at
+  only with `Ctrl+Shift+H`; never `.git`, `node_modules`, `target`; capped at
   50,000 entries) and ranks
   with `files::score` (subsequence match; file name, word starts and runs
   score higher; the extension scores nothing).
@@ -113,13 +114,34 @@ How it works (`editor.rs`, with `Engine::splice*` in `layout.rs`):
   click back to a source range for the right-click menu. Words come from
   `spell::words`, which skips code-like tokens; spans with code, link, math
   or syntax styles are skipped too.
+- **Mermaid** (`diagram.rs`, `Lx::diagram`): a mermaid code block that
+  parses is laid out as its picture (centred, scaled to the font size,
+  fitted to the column); with the caret in it, the source view gets the
+  diagram below it (`Laid::code_h` keeps the code background to the code).
+  `Engine::diagrams` caches SVG + raster by `diagram::key` (source with
+  trailing whitespace ignored, and the theme). Rasters are 2× the shown
+  size and requested again when zoom changes a lot; the view rasterizes
+  them on `gio::spawn_blocking`, after an 80 ms pause while editing, and
+  `take_diagram_requests` first drops diagrams no block shows (versions
+  typed past). `diagram_preview` keeps the last drawn preview up while the
+  next one rasterizes, so typing doesn't flicker.
+- **Find & replace** (`app.rs` `Win::replace`): matches are positions in the
+  shown text; `Engine::match_src` maps one to source and refuses it unless
+  the source holds exactly that text (no formatting inside). The end maps
+  from the last character, since at a run boundary the end offset maps
+  past the following syntax. Replace all is `Engine::replace_all` →
+  `multi_edit` (one undo step); replace one edits, searches again and
+  continues from after the new text (`find_from`). Find skips diagrams that
+  are drawn. `Ctrl+H` is replace (as in Typora and GNOME Text Editor);
+  hidden files moved to `Ctrl+Shift+H` in 0.6.
 - **Settings:** `~/.config/folio/settings` (`key=value`: spell, sidebar,
   side_page, show_hidden), read at startup and written when they change.
 
 Next steps for existing features, roughly in priority order (new features
 are in `docs/ROADMAP.md`):
 
-1. Show the image under its source while an image block is active.
+1. Show the image under its source while an image block is active (the
+   Mermaid preview under its source is the model: `Laid::code_h` + `img`).
 2. Renumber ordered lists after edits; re-pad a table's columns when the
    caret leaves it (as one undo step); make a selection across table cells
    clear the cells instead of deleting pipes.
@@ -222,7 +244,8 @@ The agent's shell has no display. What works:
   file in `FOLIO_SCREENSHOT` runs. Popovers (the right-click spelling menu)
   can't be screenshotted; `editor::tests::spelling_correction` covers it.
 - More `drive.py` quirks: the first click into a fresh session often only
-  focuses the window, so start with a throwaway click; and don't set
+  focuses the window, so start with a throwaway click, and leave a second
+  before the first shortcut (a `Ctrl` key straight after it got lost); and don't set
   `XDG_CONFIG_HOME` for the app (the window then stays unfocused and gets
   no input). The app writes `~/.config/folio/settings`; tests that toggle
   the sidebar change it, so back up the user's file first and put it back

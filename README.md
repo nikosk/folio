@@ -55,7 +55,7 @@ cargo build --release
   - **Files:** the document's project (its git work tree, or else its
     folder) as a tree of folders and Markdown files, with the open file
     highlighted. Click a file to open it; the up arrow browses the parent
-    folder. Hidden files show with `Ctrl+H` (as in Files/Nautilus); a hidden
+    folder. Hidden files show with `Ctrl+Shift+H`; a hidden
     folder holding the open file always shows.
   - **Git status** in a repository: **M** modified, **S** staged, **A** added,
     **R** renamed, **N** new (untracked), **!** conflict; ignored files are
@@ -84,12 +84,22 @@ cargo build --release
 - Syntax highlighting for ~30 languages (built-in, zero startup cost).
 - Inline and display math rendered as Unicode (`$e^{i\pi}$` → e<sup>iπ</sup>);
   not a full TeX typesetter.
+- Mermaid diagrams: a ```` ```mermaid ```` block is drawn as a diagram
+  (flowchart, sequence, class, state, ER, gantt, pie and more), in the light
+  or dark theme. With the caret in it you edit its source with the live
+  diagram underneath; one that doesn't parse shows its code and the error.
+  Rendering is native (no browser): under 0.1 ms per diagram, then drawn
+  off the main thread.
 - Local images (PNG, JPEG, GIF, WebP, SVG via the system loaders), decoded off
   the main thread; their size is read from the file header so layout never jumps.
   Remote images are shown as link chips (Folio makes no network requests).
 - Light and dark themes, following the GNOME colour-scheme setting live.
 - Text selection (drag, double-click word, triple-click block), copy,
   primary selection, find with match highlighting.
+- Find & replace (`Ctrl+H`): replace one match at a time or all of them
+  (one undo step), optionally matching case. Text found across formatting
+  (`a **b**` as "a b") is left alone and reported, so markup is never
+  mangled; drawn diagrams aren't searched.
 - Live reload when another program changes the file (your own saves are
   recognised; with unsaved edits you are asked first).
 - Relative links to other Markdown files open in place (`Ctrl`+click while
@@ -110,13 +120,14 @@ cargo build --release
 | Sidebar (outline, files) | `F9` |
 | Go to file | `Ctrl+P` |
 | Spell check on/off | `F7` |
-| Show hidden files (sidebar, go to file) | `Ctrl+H` |
+| Show hidden files (sidebar, go to file) | `Ctrl+Shift+H` |
 | Copy file path | `Ctrl+Alt+C` |
 | Move by word / line edge / document edge | `Ctrl+←→`, `Home`/`End`, `Ctrl+Home`/`Ctrl+End` (add `Shift` to select) |
 | Delete word | `Ctrl+Backspace`, `Ctrl+Delete` |
 | Line break inside a block | `Shift+Enter` |
 | Stop editing (reading mode) | `Esc` |
 | Find / next / previous | `Ctrl+F` / `Enter`, `Ctrl+G` / `Shift+Enter`, `Ctrl+Shift+G` |
+| Find & replace / replace one / replace all | `Ctrl+H` / `Enter` in the replace field / `Ctrl+Enter` |
 | Zoom in / out / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, or `Ctrl`+scroll |
 | Toggle dark mode | `Ctrl+D` |
 | Reload | `Ctrl+R`, `F5` |
@@ -155,6 +166,8 @@ pessimistic), 750 KB / 2,700-block file:
 | Lay out one screen (fonts warm) | ~3 ms |
 | Scroll step (new blocks entering view) | 0.9 ms median, 2.5 ms max |
 | Find across the whole document | 1.8 ms |
+| Replace all (4,225 matches of "the") / undo it | 11–15 ms / 9–12 ms |
+| Mermaid diagram to SVG (layout knows its size at once) | 0.01–0.07 ms |
 | Keystroke: edit + re-parse + layout (typing into a paragraph) | 0.42 ms median, 1.7 ms max |
 | Keystroke: Enter / undo | 0.07 ms / 0.06 ms median |
 | Keystroke in a 7-row table cell (the table is re-laid out) | 0.42 ms median, 0.7 ms max |
@@ -179,7 +192,7 @@ folio --render out.png [--width 1000] [--height 1300] [--scroll Y] [--dark] [--s
 folio --bench FILE                     # engine and typing timings, no display needed
 python3 samples/gen_big.py             # generate samples/big.md for benchmarking
 FOLIO_STARTUP=1 folio FILE             # print startup phase timings, exit after first frame
-FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND, FOLIO_SIDEBAR, FOLIO_QUICK, FOLIO_OPEN)
+FOLIO_SCREENSHOT=out.png folio FILE    # screenshot the live window and exit (FOLIO_SCROLL, FOLIO_FIND, FOLIO_REPLACE, FOLIO_SIDEBAR, FOLIO_QUICK, FOLIO_OPEN)
 scripts/headless-gnome.sh env FOLIO_SCREENSHOT=/tmp/s.png ./target/release/folio FILE   # no display needed
 scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(300, 400)" "type('hi')"   # scripted input
 ```
@@ -191,6 +204,7 @@ scripts/headless-gnome.sh python3 -I scripts/drive.py /tmp/s.png FILE "click_at(
 | `src/layout.rs` | Layout engine: lazy per-block Pango layout, virtual heights, painting, hit-testing, selection, find |
 | `src/view.rs` | GTK widget (`GtkScrollable`): scrolling, input, async image loading |
 | `src/app.rs` | Windows, actions, file loading, live reload, theme, saved settings |
+| `src/diagram.rs` | Mermaid: SVG through `mermaid-svg`, size from its viewBox, rasterizing |
 | `src/files.rs` | Files sidebar (lazy GTK tree of the project folder) and go to file (folder walk, fuzzy ranking) |
 | `src/git.rs` | Git status for the files sidebar (`git status --porcelain`, parsed) |
 | `src/spell.rs` | Spell checking: libenchant via `dlopen`, word splitting, per-word cache |

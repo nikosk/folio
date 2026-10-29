@@ -103,7 +103,20 @@ struct Laid {
     img: Option<(gdk::Texture, f64, f64, f64, f64)>,
     /// Misspelled words: (part, start, end) in the part's text.
     typos: Vec<(usize, u32, u32)>,
+    /// Height of the code background when a diagram is drawn below it.
+    code_h: Option<f64>,
 }
+
+/// A Mermaid diagram: its SVG (or the parse error) and its raster.
+pub struct Diagram {
+    svg: Result<std::rc::Rc<crate::diagram::Svg>, String>,
+    pub img: Img,
+    /// Width of the raster requested last.
+    raster_w: u32,
+}
+
+/// A diagram to rasterize: key, SVG, pixel size.
+pub type DiagramRequest = (u64, String, u32, u32);
 
 struct Fonts {
     em: f64,
@@ -225,6 +238,11 @@ pub struct Engine {
     bg_next: usize,
     pub images: HashMap<PathBuf, Img>,
     pub img_requests: Vec<PathBuf>,
+    pub diagrams: HashMap<u64, Diagram>,
+    pub diagram_requests: Vec<DiagramRequest>,
+    /// The last diagram drawn under a source view, shown while the edited
+    /// one is rasterized so the preview doesn't flicker while typing.
+    diagram_preview: Option<gdk::Texture>,
     pub sel: Option<(Pos, Pos)>,
     pub matches: Vec<(Pos, usize)>,
     pub cur_match: Option<usize>,
@@ -261,6 +279,9 @@ impl Engine {
             bg_next: 0,
             images: HashMap::new(),
             img_requests: Vec::new(),
+            diagrams: HashMap::new(),
+            diagram_requests: Vec::new(),
+            diagram_preview: None,
             sel: None,
             matches: Vec::new(),
             cur_match: None,
@@ -527,6 +548,9 @@ impl Engine {
             base_dir: &self.base_dir,
             images: &mut self.images,
             req: &mut self.img_requests,
+            diagrams: &mut self.diagrams,
+            dreq: &mut self.diagram_requests,
+            preview: &mut self.diagram_preview,
         };
         lx.block(&self.doc.blocks[i], w)
     }
@@ -647,6 +671,56 @@ impl Engine {
         }
     }
 
+    /// A diagram's raster arrived: re-lay out the diagram blocks (their
+    /// size was known already, so nothing moves).
+    pub fn diagram_ready(&mut self, key: u64, tex: Option<gdk::Texture>) {
+        let Some(d) = self.diagrams.get_mut(&key) else { return };
+        match tex {
+            Some(t) => d.img = Img::Ready(t),
+            None if !matches!(d.img, Img::Ready(_)) => d.img = Img::Failed,
+            None => {}
+        }
+        for i in 0..self.len() {
+            if self.is_diagram(i) {
+                self.invalidate_block(i);
+            }
+        }
+    }
+
+    fn is_diagram(&self, i: usize) -> bool {
+        match &self.doc.blocks[i].kind {
+            Kind::Code { lang, .. } | Kind::Source { style: SrcStyle::Code { lang, .. }, .. } => crate::diagram::is_mermaid(lang),
+            _ => false,
+        }
+    }
+
+    /// The source of each diagram block (the code inside the fences).
+    fn diagram_sources(&self) -> Vec<&str> {
+        (0..self.len())
+            .filter(|&i| self.is_diagram(i))
+            .map(|i| match &self.doc.blocks[i].kind {
+                Kind::Code { text, .. } => text.as_str(),
+                Kind::Source { rich, style: SrcStyle::Code { body, .. } } => &rich.text[body.clone()],
+                _ => "",
+            })
+            .collect()
+    }
+
+    /// Drop diagrams no block shows any more (versions typed past), and
+    /// return the raster requests still wanted.
+    pub fn take_diagram_requests(&mut self) -> Vec<DiagramRequest> {
+        let dark = self.theme.dark;
+        let live: std::collections::HashSet<u64> = self.diagram_sources().iter().map(|s| crate::diagram::key(s, dark)).collect();
+        self.diagrams.retain(|k, _| live.contains(k));
+        let mut reqs = std::mem::take(&mut self.diagram_requests);
+        reqs.retain(|r| self.diagrams.contains_key(&r.0));
+        // Only the newest request per diagram.
+        reqs.reverse();
+        let mut seen = std::collections::HashSet::new();
+        reqs.retain(|r| seen.insert(r.0));
+        reqs
+    }
+
     // ---- painting -------------------------------------------------------
 
     pub fn paint(&mut self, p: &mut dyn Painter, top: f64, height: f64) {
@@ -686,7 +760,9 @@ impl Engine {
 
         match &b.kind {
             Kind::Code { .. } | Kind::FrontMatter(_) | Kind::Source { style: SrcStyle::Code { .. }, .. } => {
-                p.rrect(x, oy, w, laid.h, 6.0, &th.code_bg)
+                if laid.img.is_none() || laid.code_h.is_some() {
+                    p.rrect(x, oy, w, laid.code_h.unwrap_or(laid.h), 6.0, &th.code_bg)
+                }
             }
             _ if heading_level(&b.kind).is_some_and(|l| l <= 2) => p.rect(x, oy + laid.h - 1.0, w, 1.0, &th.border),
             Kind::Rule => p.rect(x, oy + (laid.h / 2.0).round() - 1.0, w, 2.0, &th.border),
@@ -1055,22 +1131,37 @@ impl Engine {
         Some(self.pos_y(Pos { block: i, part: 0, idx: 0 }) - self.em())
     }
 
-    pub fn find(&mut self, q: &str) -> usize {
+    /// Find `q` in the text as shown; ASCII letters match either case
+    /// unless `case` is set.
+    pub fn find(&mut self, q: &str, case: bool) -> usize {
         self.matches.clear();
         self.cur_match = None;
         if q.is_empty() {
             return 0;
         }
         let ql = q.to_ascii_lowercase();
-        let qb = ql.as_bytes();
+        let qb = if case { q.as_bytes() } else { ql.as_bytes() };
+        let dark = self.theme.dark;
         for (bi, b) in self.doc.blocks.iter().enumerate() {
+            // A drawn diagram's text isn't on screen: matches there couldn't be
+            // seen, and replacing them would break the diagram unnoticed.
+            if let Kind::Code { lang, text } = &b.kind
+                && crate::diagram::is_mermaid(lang)
+                && self
+                    .diagrams
+                    .get(&crate::diagram::key(text, dark))
+                    .map_or_else(|| crate::diagram::render(text, dark).is_ok(), |d| d.svg.is_ok())
+            {
+                continue;
+            }
             for pi in 0..b.part_count() {
                 let t = b.part_text(pi);
                 if q.is_ascii() {
                     let tb = t.as_bytes();
                     let mut k = 0;
                     while k + qb.len() <= tb.len() {
-                        if tb[k..k + qb.len()].eq_ignore_ascii_case(qb) {
+                        let hit = if case { &tb[k..k + qb.len()] == qb } else { tb[k..k + qb.len()].eq_ignore_ascii_case(qb) };
+                        if hit {
                             self.matches.push((Pos { block: bi, part: pi, idx: k }, k + qb.len()));
                             k += qb.len();
                         } else {
@@ -1085,6 +1176,30 @@ impl Engine {
             }
         }
         self.matches.len()
+    }
+
+    /// The source range of match `k`, if it is the same text there: a match
+    /// running across formatting (`a **b**` found as "a b") has none.
+    pub fn match_src(&self, k: usize) -> Option<std::ops::Range<usize>> {
+        let (p, end) = *self.matches.get(k)?;
+        let b = self.doc.blocks.get(p.block)?;
+        // The end from the last character: at a run boundary the end offset
+        // itself maps past the syntax that follows (`foo|**`).
+        let last = b.part_text(p.part).get(p.idx..end)?.chars().next_back()?.len_utf8();
+        let (s, e) = (b.text_to_src(p.part, p.idx), b.text_to_src(p.part, end - last) + last);
+        (s <= e && self.src.get(s..e) == b.part_text(p.part).get(p.idx..end)).then_some(s..e)
+    }
+
+    /// Make the first match at or after source offset `off` (wrapping) the
+    /// current one.
+    pub fn find_from(&mut self, off: usize) -> Option<Pos> {
+        let n = self.matches.len();
+        if n == 0 {
+            return None;
+        }
+        let k = (0..n).find(|&k| self.pos_to_off(self.matches[k].0) >= off).unwrap_or(0);
+        self.cur_match = Some(k);
+        Some(self.matches[k].0)
     }
 
     /// Advance to the next/previous match; the first step picks the first
@@ -1218,6 +1333,9 @@ struct Lx<'a> {
     base_dir: &'a Path,
     images: &'a mut HashMap<PathBuf, Img>,
     req: &'a mut Vec<PathBuf>,
+    diagrams: &'a mut HashMap<u64, Diagram>,
+    dreq: &'a mut Vec<DiagramRequest>,
+    preview: &'a mut Option<gdk::Texture>,
 }
 
 impl Lx<'_> {
@@ -1324,7 +1442,16 @@ impl Lx<'_> {
         let mut deco = Vec::new();
         let mut table = None;
         let mut img = None;
+        let mut code_h = None;
         let h = match &b.kind {
+            // A diagram that renders replaces its code.
+            Kind::Code { lang, text } if crate::diagram::is_mermaid(lang) && self.diagram(text, w).is_ok_and(|d| !d.3) => {
+                let Ok((dw, dh, tex, _)) = self.diagram(text, w) else { return laid };
+                if let Some(t) = tex {
+                    img = Some((t, (w - dw) / 2.0, 0.0, dw, dh));
+                }
+                dh
+            }
             Kind::Para(r) => {
                 let l = self.rich(r, &body, w, line_h, alert_of(b));
                 l.0.set_alignment(align);
@@ -1369,7 +1496,15 @@ impl Lx<'_> {
                     let lw = ll.pixel_size().0 as f64;
                     deco.push(Deco::Text(ll, w - lw - 0.6 * em, 0.35 * em, th.muted));
                 }
-                h + 2.0 * pady
+                let h = h + 2.0 * pady;
+                // A diagram that doesn't parse shows its code, and why.
+                match self.diagram(text, w).err().filter(|_| crate::diagram::is_mermaid(lang)) {
+                    Some(e) => {
+                        code_h = Some(h);
+                        h + self.error_note(&e, h, w, &mut deco)
+                    }
+                    None => h,
+                }
             }
             Kind::Math(r) => {
                 let l = self.rich(r, &font(MATH_FONT, 1.1 * em), w, 1.6 * em, None);
@@ -1412,7 +1547,30 @@ impl Lx<'_> {
                         }
                     }
                     l.set_attributes(Some(&attrs));
-                    part((l, Vec::new()), padx, pady, w - 2.0 * padx, th.fg) + 2.0 * pady
+                    let h = part((l, Vec::new()), padx, pady, w - 2.0 * padx, th.fg) + 2.0 * pady;
+                    if !crate::diagram::is_mermaid(lang) {
+                        h
+                    } else {
+                        // The live diagram (or the error) under its source.
+                        code_h = Some(h);
+                        let gap = 0.75 * em;
+                        match self.diagram(&text[code.clone()], w) {
+                            Ok((dw, dh, tex, _)) => {
+                                let tex = match tex {
+                                    Some(t) => {
+                                        *self.preview = Some(t.clone());
+                                        Some(t)
+                                    }
+                                    None => self.preview.clone(),
+                                };
+                                if let Some(t) = tex {
+                                    img = Some((t, (w - dw) / 2.0, h + gap, dw, dh));
+                                }
+                                h + gap + dh
+                            }
+                            Err(e) => h + self.error_note(&e, h, w, &mut deco),
+                        }
+                    }
                 }
             },
             Kind::Rule => 0.6 * em,
@@ -1525,7 +1683,47 @@ impl Lx<'_> {
         laid.deco = deco;
         laid.table = table;
         laid.img = img;
+        laid.code_h = code_h;
         laid
+    }
+
+    /// A diagram's parse error under its code at `y`; returns the height used.
+    fn error_note(&self, e: &str, y: f64, w: f64, deco: &mut Vec<Deco>) -> f64 {
+        let size = 0.85 * self.em;
+        let mut desc = font(BODY_FONT, size);
+        desc.set_style(pango::Style::Italic);
+        let l = self.layout(&format!("Mermaid: {e}"), &desc, w, size * 1.4);
+        let h = l.pixel_size().1 as f64;
+        deco.push(Deco::Text(l, 0.0, y + 0.4 * self.em, self.th.muted));
+        0.4 * self.em + h
+    }
+
+    /// A Mermaid diagram's size at this font size, fitted to `w`, and its
+    /// texture once rasterized, and whether rasterizing failed; or the
+    /// parse error.
+    fn diagram(&mut self, src: &str, w: f64) -> Result<(f64, f64, Option<gdk::Texture>, bool), String> {
+        let dark = self.th.dark;
+        let key = crate::diagram::key(src, dark);
+        let d = self.diagrams.entry(key).or_insert_with(|| Diagram {
+            svg: crate::diagram::render(src, dark).map(std::rc::Rc::new),
+            img: Img::Pending(None),
+            raster_w: 0,
+        });
+        let svg = d.svg.as_ref().map_err(Clone::clone)?;
+        // Drawn at the document's font size (Mermaid lays out for 16 px).
+        let dw = (svg.w * self.em / 16.0).min(w).max(1.0);
+        let dh = svg.h * dw / svg.w;
+        // Twice the size shown, for HiDPI screens; again when zoomed far.
+        let rw = (2.0 * dw).ceil() as u32;
+        if rw > d.raster_w || rw * 2 < d.raster_w {
+            d.raster_w = rw;
+            self.dreq.push((key, svg.svg.clone(), rw, (2.0 * dh).ceil() as u32));
+        }
+        let tex = match &d.img {
+            Img::Ready(t) => Some(t.clone()),
+            _ => None,
+        };
+        Ok((dw, dh, tex, matches!(d.img, Img::Failed)))
     }
 }
 

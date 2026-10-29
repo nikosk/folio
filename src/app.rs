@@ -215,7 +215,8 @@ fn startup(app: &gtk::Application) {
         ("app.quit", &["<Ctrl>q"][..]),
         ("app.toggle-theme", &["<Ctrl>d"]),
         ("app.spell", &["F7"]),
-        ("app.show-hidden", &["<Ctrl>h"]),
+        ("app.show-hidden", &["<Ctrl><Shift>h"]),
+        ("win.replace", &["<Ctrl>h"]),
         ("win.sidebar", &["F9"]),
         ("win.quick-open", &["<Ctrl>p"]),
         ("app.new", &["<Ctrl>n"]),
@@ -245,6 +246,9 @@ struct Win {
     search: gtk::SearchBar,
     entry: gtk::SearchEntry,
     count: gtk::Label,
+    case_btn: gtk::ToggleButton,
+    replace_btn: gtk::ToggleButton,
+    replace_entry: gtk::Entry,
     path: RefCell<Option<PathBuf>>,
     history: RefCell<Vec<PathBuf>>,
     monitor: RefCell<Option<gio::FileMonitor>>,
@@ -329,11 +333,46 @@ impl Win {
         let next = gtk::Button::from_icon_name("go-down-symbolic");
         next.set_action_name(Some("win.find-next"));
         next.set_tooltip_text(Some("Next match (Enter)"));
-        let sbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        sbox.append(&entry);
-        sbox.append(&count);
-        sbox.append(&prev);
-        sbox.append(&next);
+        let case_btn = gtk::ToggleButton::with_label("Aa");
+        case_btn.set_tooltip_text(Some("Match case"));
+        case_btn.add_css_class("flat");
+        let replace_btn = gtk::ToggleButton::new();
+        replace_btn.set_icon_name("edit-find-replace-symbolic");
+        replace_btn.set_tooltip_text(Some("Replace (Ctrl+H)"));
+        replace_btn.add_css_class("flat");
+        let find_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        find_row.append(&replace_btn);
+        find_row.append(&entry);
+        find_row.append(&case_btn);
+        find_row.append(&count);
+        find_row.append(&prev);
+        find_row.append(&next);
+        // The replace row lines up under the find field.
+        let replace_entry = gtk::Entry::builder().placeholder_text("Replace with").width_chars(34).build();
+        let replace_one = gtk::Button::with_label("Replace");
+        replace_one.set_action_name(Some("win.replace-one"));
+        replace_one.set_tooltip_text(Some("Replace this match and go to the next (Enter)"));
+        let replace_all = gtk::Button::with_label("Replace All");
+        replace_all.set_action_name(Some("win.replace-all"));
+        replace_all.set_tooltip_text(Some("Replace every match, as one undo step (Ctrl+Enter)"));
+        let replace_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let align = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+        align.add_widget(&replace_btn);
+        align.add_widget(&spacer);
+        replace_row.append(&spacer);
+        replace_row.append(&replace_entry);
+        replace_row.append(&replace_one);
+        replace_row.append(&replace_all);
+        let replace_rev = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(120)
+            .child(&replace_row)
+            .build();
+        replace_btn.bind_property("active", &replace_rev, "reveal-child").sync_create().build();
+        let sbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        sbox.append(&find_row);
+        sbox.append(&replace_rev);
         let search = gtk::SearchBar::builder().child(&sbox).show_close_button(true).build();
         search.connect_entry(&entry);
         find_btn.bind_property("active", &search, "search-mode-enabled").bidirectional().build();
@@ -395,6 +434,9 @@ impl Win {
             search,
             entry,
             count,
+            case_btn,
+            replace_btn,
+            replace_entry,
             path: RefCell::new(None),
             history: RefCell::new(Vec::new()),
             monitor: RefCell::new(None),
@@ -478,7 +520,8 @@ impl Win {
     }
 
     /// Debug hook: FOLIO_SCREENSHOT=out.png [FOLIO_SCROLL=y] [FOLIO_FIND=text]
-    /// [FOLIO_SIDEBAR=outline|files] [FOLIO_QUICK=query] [FOLIO_OPEN=file] [FOLIO_DELAY=ms]
+    /// [FOLIO_REPLACE=text] [FOLIO_SIDEBAR=outline|files] [FOLIO_QUICK=query]
+    /// [FOLIO_OPEN=file] [FOLIO_DELAY=ms]
     /// renders the live window with GTK's renderer, saves it
     /// and exits. FOLIO_DELAY leaves time for scripted input.
     fn debug_screenshot(self: &Rc<Self>, out: String) {
@@ -488,6 +531,10 @@ impl Win {
             if let Ok(q) = std::env::var("FOLIO_FIND") {
                 w.search.set_search_mode(true);
                 w.entry.set_text(&q);
+            }
+            if let Ok(r) = std::env::var("FOLIO_REPLACE") {
+                w.replace_btn.set_active(true);
+                w.replace_entry.set_text(&r);
             }
             if let Some(y) = std::env::var("FOLIO_SCROLL").ok().and_then(|y| y.parse().ok()) {
                 w.view.scroll_to(y);
@@ -542,6 +589,17 @@ impl Win {
             w.entry.select_region(0, -1);
         });
         self.action("find-next", |w| w.find_step(true));
+        self.action("replace", |w| {
+            w.search.set_search_mode(true);
+            w.replace_btn.set_active(true);
+            if w.entry.text().is_empty() {
+                w.entry.grab_focus();
+            } else {
+                w.replace_entry.grab_focus();
+            }
+        });
+        self.action("replace-one", |w| w.replace(false));
+        self.action("replace-all", |w| w.replace(true));
         self.action("find-prev", |w| w.find_step(false));
         self.action("zoom-in", |w| w.view.set_zoom(w.view.zoom() * 1.1));
         self.action("zoom-out", |w| w.view.set_zoom(w.view.zoom() / 1.1));
@@ -570,10 +628,38 @@ impl Win {
     }
 
     fn setup_search(self: &Rc<Self>) {
+        // Toggling match case searches again.
+        let weak = Rc::downgrade(self);
+        self.case_btn.connect_toggled(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.entry.emit_by_name::<()>("search-changed", &[]);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.replace_entry.connect_activate(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.replace(false);
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(w) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) && state.contains(gdk::ModifierType::CONTROL_MASK) {
+                w.replace(true);
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::Escape {
+                w.search.set_search_mode(false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.replace_entry.add_controller(keys);
         let weak = Rc::downgrade(self);
         self.entry.connect_search_changed(move |e| {
             if let Some(w) = weak.upgrade() {
-                let n = w.view.find(&e.text());
+                let n = w.view.find(&e.text(), w.case_btn.is_active());
                 if n == 0 {
                     w.count.set_text(if e.text().is_empty() { "" } else { "No matches" });
                 } else {
@@ -607,11 +693,40 @@ impl Win {
         self.search.connect_search_mode_enabled_notify(move |s| {
             if let Some(w) = weak.upgrade()
                 && !s.is_search_mode() {
-                    w.view.find("");
+                    w.view.find("", false);
                     w.count.set_text("");
                     w.view.grab_focus();
                 }
         });
+    }
+
+    /// Replace the current match (then go to the next) or every match.
+    fn replace(&self, all: bool) {
+        let (q, with) = (self.entry.text(), self.replace_entry.text());
+        if q.is_empty() {
+            return;
+        }
+        if all {
+            let (done, skipped) = self.view.replace_all(&with);
+            let mut msg = if done == 0 { "Nothing replaced".to_string() } else { format!("Replaced {done}") };
+            if skipped > 0 {
+                msg.push_str(&format!(", {skipped} skipped (formatting inside)"));
+            }
+            self.count.set_text(&msg);
+            return;
+        }
+        match self.view.replace_current(&with) {
+            Some(after) => {
+                // Editing searched again; continue after the new text.
+                self.view.find(&q, self.case_btn.is_active());
+                match self.view.find_from(after) {
+                    Some((i, n)) => self.count.set_text(&format!("{i} of {n}")),
+                    None => self.count.set_text("No more matches"),
+                }
+            }
+            // No current match yet, or one across formatting: move on.
+            None => self.find_step(true),
+        }
     }
 
     fn find_step(&self, forward: bool) {
@@ -1038,7 +1153,7 @@ impl Win {
 
     fn refresh_search(&self) {
         if self.search.is_search_mode() && !self.entry.text().is_empty() {
-            let n = self.view.find(&self.entry.text());
+            let n = self.view.find(&self.entry.text(), self.case_btn.is_active());
             self.count.set_text(&if n == 0 { "No matches".into() } else { format!("{n} matches") });
         }
     }

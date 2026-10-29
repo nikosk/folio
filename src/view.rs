@@ -52,6 +52,8 @@ mod imp {
         pub context_menu: RefCell<Option<gtk::PopoverMenu>>,
         pub table_sections: RefCell<Vec<gio::Menu>>,
         pub spell: Cell<bool>,
+        /// Pending rasterization of Mermaid diagrams.
+        pub diagram_timer: RefCell<Option<glib::SourceId>>,
         /// The misspelled word the context menu was opened on.
         pub typo: RefCell<Option<(std::ops::Range<usize>, String)>>,
         /// The document's folder once it has been saved; pasted images go
@@ -89,6 +91,7 @@ mod imp {
                 table_sections: RefCell::new(Vec::new()),
                 spell: Cell::new(false),
                 typo: RefCell::new(None),
+                diagram_timer: RefCell::new(None),
                 doc_dir: RefCell::new(None),
             }
         }
@@ -458,6 +461,7 @@ impl DocView {
         vadj.configure(top, 0.0, total.max(h), em * 3.0, h * 0.9, h);
         imp.busy.set(false);
         self.load_images();
+        self.load_diagrams();
         if !done && !imp.bg_running.get() {
             imp.bg_running.set(true);
             glib::idle_add_local(clone!(
@@ -494,6 +498,48 @@ impl DocView {
         } else {
             glib::ControlFlow::Continue
         }
+    }
+
+    /// Rasterize the diagrams layout asked for, on a worker thread. While
+    /// editing, wait for a pause in typing so only the version typed last
+    /// is drawn.
+    fn load_diagrams(&self) {
+        let imp = self.imp();
+        let (pending, editing) = match imp.eng.borrow().as_ref() {
+            Some(e) => (!e.diagram_requests.is_empty(), e.editing()),
+            None => return,
+        };
+        if !pending {
+            return;
+        }
+        if let Some(id) = imp.diagram_timer.take() {
+            id.remove();
+        }
+        let delay = Duration::from_millis(if editing { 80 } else { 0 });
+        let id = glib::timeout_add_local_once(
+            delay,
+            clone!(
+                #[weak(rename_to = obj)]
+                self,
+                move || {
+                    obj.imp().diagram_timer.take();
+                    let reqs = match obj.imp().eng.borrow_mut().as_mut() {
+                        Some(e) => e.take_diagram_requests(),
+                        None => return,
+                    };
+                    for (key, svg, w, h) in reqs {
+                        let obj = obj.downgrade();
+                        glib::spawn_future_local(async move {
+                            let tex = gio::spawn_blocking(move || crate::diagram::rasterize(&svg, w, h)).await.ok().flatten();
+                            if let Some(obj) = obj.upgrade() {
+                                obj.relayout(|e| e.diagram_ready(key, tex));
+                            }
+                        });
+                    }
+                }
+            ),
+        );
+        *imp.diagram_timer.borrow_mut() = Some(id);
     }
 
     fn load_images(&self) {
@@ -534,8 +580,8 @@ impl DocView {
 
     // ---- find ------------------------------------------------------------
 
-    pub fn find(&self, q: &str) -> usize {
-        let n = self.imp().eng.borrow_mut().as_mut().map_or(0, |e| e.find(q));
+    pub fn find(&self, q: &str, case: bool) -> usize {
+        let n = self.imp().eng.borrow_mut().as_mut().map_or(0, |e| e.find(q, case));
         self.queue_draw();
         n
     }
@@ -543,11 +589,23 @@ impl DocView {
     /// Step to the next/previous match; returns (1-based index, total).
     pub fn find_step(&self, forward: bool) -> Option<(usize, usize)> {
         let top = self.top();
+        self.show_match(|e| e.find_step(forward, top))
+    }
+
+    /// Make the first match at or after source offset `off` current.
+    pub fn find_from(&self, off: usize) -> Option<(usize, usize)> {
+        self.show_match(|e| e.find_from(off))
+    }
+
+    /// Pick a match with `f` and scroll it into view; returns (1-based
+    /// index, total).
+    fn show_match(&self, f: impl FnOnce(&mut Engine) -> Option<crate::layout::Pos>) -> Option<(usize, usize)> {
+        let top = self.top();
         let h = self.height() as f64;
         let (y, cur, total) = {
             let mut eng = self.imp().eng.borrow_mut();
             let e = eng.as_mut()?;
-            let pos = e.find_step(forward, top)?;
+            let pos = f(e)?;
             (e.pos_y(pos), e.cur_match? + 1, e.matches.len())
         };
         if y < top + 0.1 * h || y > top + 0.85 * h {
@@ -555,6 +613,37 @@ impl DocView {
         }
         self.queue_draw();
         Some((cur, total))
+    }
+
+    /// Replace the current match. Returns the source offset after the new
+    /// text, or `None` if there is no current match or it runs across
+    /// formatting (then it is left alone).
+    pub fn replace_current(&self, with: &str) -> Option<usize> {
+        let r = {
+            let eng = self.imp().eng.borrow();
+            let e = eng.as_ref()?;
+            e.match_src(e.cur_match?)?
+        };
+        let at = r.start + with.len();
+        self.with_edit(|e| e.replace(r, with));
+        Some(at)
+    }
+
+    /// Replace every match, as one undo step. Returns (replaced, skipped
+    /// because they run across formatting).
+    pub fn replace_all(&self, with: &str) -> (usize, usize) {
+        let (ranges, total) = {
+            let eng = self.imp().eng.borrow();
+            let Some(e) = eng.as_ref() else { return (0, 0) };
+            let mut v: Vec<_> = (0..e.matches.len()).filter_map(|k| e.match_src(k)).collect();
+            v.sort_by_key(|r| r.start);
+            v.dedup_by(|b, a| b.start < a.end);
+            (v, e.matches.len())
+        };
+        if !ranges.is_empty() {
+            self.with_edit(|e| e.replace_all(&ranges, with));
+        }
+        (ranges.len(), total - ranges.len())
     }
 
     // ---- selection & clipboard -------------------------------------------
